@@ -6,18 +6,77 @@ import requests
 import urllib.parse
 import json
 import os
+import re
 from io import BytesIO
 from datetime import date, datetime, timedelta
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ===============================
 # CONFIGURAÇÕES INICIAIS
 # ===============================
-st.set_page_config(page_title="🌱 Gerenciador Integrado de Produção", layout="wide")
+st.set_page_config(
+    page_title="🌱 Sistema Integrado de Gestão Agrícola", 
+    layout="wide",
+    page_icon="🌱"
+)
+
+# Tema personalizado mais profissional
 plt.style.use("dark_background")
 sns.set_theme(style="darkgrid")
+
+# Cores personalizadas para o tema escuro
+colors = {
+    'primary': '#2E8B57',  # Verde agrícola
+    'secondary': '#3CB371',
+    'accent': '#FFD700',   # Dourado
+    'background': '#1A1A1A',
+    'text': '#FFFFFF',
+    'success': '#32CD32',
+    'warning': '#FFA500',
+    'danger': '#DC143C'
+}
+
+# Aplicar estilo CSS personalizado
+st.markdown(f"""
+<style>
+    .main .block-container {{
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        background-color: {colors['background']};
+        color: {colors['text']};
+    }}
+    .stButton>button {{
+        background-color: {colors['primary']};
+        color: white;
+        border: none;
+        border-radius: 4px;
+        padding: 0.5rem 1rem;
+    }}
+    .stButton>button:hover {{
+        background-color: {colors['secondary']};
+        color: white;
+    }}
+    .css-1d391kg {{
+        background-color: {colors['background']};
+    }}
+    h1, h2, h3, h4, h5, h6 {{
+        color: {colors['primary']};
+    }}
+    .stMetric {{
+        background-color: #2A2A2A;
+        padding: 15px;
+        border-radius: 10px;
+        border-left: 4px solid {colors['primary']};
+    }}
+    .stAlert {{
+        border-radius: 10px;
+    }}
+</style>
+""", unsafe_allow_html=True)
 
 # Constantes
 DB_NAME = "dados_sitio.db"
@@ -32,6 +91,8 @@ TIPOS_INSUMOS = [
 ]
 
 UNIDADES = ["kg", "g", "L", "mL", "unidade", "saco", "caixa", "pacote"]
+
+# Gerar estufas e campos com formatação padronizada
 ESTUFAS = [f"Estufa {i}" for i in range(1, 31)]
 CAMPOS = [f"Campo {i}" for i in range(1, 31)]
 AREAS_PRODUCAO = ESTUFAS + CAMPOS
@@ -68,17 +129,24 @@ def criar_tabelas():
         )
         """,
         """
-        CREATE TABLE IF NOT EXISTS fenologia_especies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, especie TEXT UNIQUE,
-            estagios TEXT
-        )
-        """,
-        """
         CREATE TABLE IF NOT EXISTS precos_culturas (
             id INTEGER PRIMARY KEY AUTOINCREMENT, 
             cultura TEXT UNIQUE,
             preco_primeira REAL,
             preco_segunda REAL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS plantios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_plantio TEXT,
+            area TEXT,
+            cultura TEXT,
+            quantidade_mudas INTEGER,
+            espacamento TEXT,
+            estimativa_colheita REAL,
+            data_estimada_colheita TEXT,
+            observacoes TEXT
         )
         """
     ]
@@ -88,6 +156,53 @@ def criar_tabelas():
     
     conn.commit()
     conn.close()
+
+def normalizar_nome_area(nome):
+    """Normaliza o nome da área para formato padrão"""
+    if not nome or pd.isna(nome):
+        return ""
+    
+    nome = str(nome).strip()
+    
+    # Padronizar Estufa
+    if re.match(r'estufa\s*\d+', nome.lower()):
+        numero = re.search(r'\d+', nome).group()
+        return f"Estufa {numero}"
+    
+    # Padronizar Campo
+    if re.match(r'campo\s*\d+', nome.lower()):
+        numero = re.search(r'\d+', nome).group()
+        return f"Campo {numero}"
+    
+    return nome
+
+def normalizar_colunas(df):
+    """Normaliza os nomes das colunas do DataFrame"""
+    df = df.copy()
+    col_map = {
+        "Estufa": "area", "Área": "area", "Produção": "caixas", 
+        "Primeira": "caixas", "Segunda": "caixas_segunda", 
+        "Qtd": "caixas", "Quantidade": "caixas", "Data": "data",
+        "Observação": "observacao", "Observacoes": "observacao", "Obs": "observacao"
+    }
+    df.rename(columns={c: col_map.get(c, c) for c in df.columns}, inplace=True)
+    
+    if "data" in df.columns: 
+        df["data"] = pd.to_datetime(df["data"], errors="coerce").dt.strftime('%Y-%m-%d')
+    
+    for col in ["caixas", "caixas_segunda", "temperatura", "umidade", "chuva", "observacao"]:
+        if col not in df.columns: 
+            df[col] = 0 if col != "observacao" else ""
+    
+    for col in ["area", "cultura"]:
+        if col not in df.columns: 
+            df[col] = ""
+    
+    # Normalizar nomes de áreas
+    if "area" in df.columns:
+        df["area"] = df["area"].apply(normalizar_nome_area)
+    
+    return df
 
 def inserir_tabela(nome_tabela, df):
     """Insere dados em uma tabela do banco"""
@@ -104,6 +219,11 @@ def carregar_tabela(nome_tabela):
     conn = sqlite3.connect(DB_NAME)
     df = pd.read_sql(f"SELECT * FROM {nome_tabela}", conn)
     conn.close()
+    
+    # Normalizar nomes de áreas se a tabela tiver essa coluna
+    if "area" in df.columns:
+        df["area"] = df["area"].apply(normalizar_nome_area)
+    
     return df
 
 def excluir_linha(nome_tabela, row_id):
@@ -111,39 +231,6 @@ def excluir_linha(nome_tabela, row_id):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(f"DELETE FROM {nome_tabela} WHERE id=?", (row_id,))
-    conn.commit()
-    conn.close()
-
-def carregar_fenologia_especies():
-    """Carrega os estágios fenológicos por espécie"""
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql("SELECT * FROM fenologia_especies", conn)
-    conn.close()
-    
-    fenologia_dict = {}
-    for _, row in df.iterrows():
-        try:
-            fenologia_dict[row['especie']] = json.loads(row['estagios'])
-        except:
-            fenologia_dict[row['especie']] = []
-    
-    return fenologia_dict
-
-def salvar_fenologia_especie(especie, estagios):
-    """Salva estágios fenológicos de uma espécie"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT id FROM fenologia_especies WHERE especie = ?", (especie,))
-    existe = cursor.fetchone()
-    
-    if existe:
-        cursor.execute("UPDATE fenologia_especies SET estagios = ? WHERE especie = ?", 
-                      (json.dumps(estagios), especie))
-    else:
-        cursor.execute("INSERT INTO fenologia_especies (especie, estagios) VALUES (?, ?)", 
-                      (especie, json.dumps(estagios)))
-    
     conn.commit()
     conn.close()
 
@@ -188,14 +275,6 @@ def carregar_config():
     if not os.path.exists(CONFIG_FILE):
         cfg = {
             "cidade": CIDADE_PADRAO,
-            "fenologia_padrao": {
-                "estagios": [
-                    {"nome": "Germinação/Vegetativo", "dias": "0-30", "adubo": 2, "agua": 1.5},
-                    {"nome": "Floração", "dias": "31-60", "adubo": 4, "agua": 2.0},
-                    {"nome": "Frutificação", "dias": "61-90", "adubo": 3, "agua": 2.5},
-                    {"nome": "Maturação", "dias": "91-120", "adubo": 1, "agua": 1.0}
-                ]
-            },
             "alerta_pct_segunda": 25.0,
             "alerta_prod_baixo_pct": 30.0,
             "preco_padrao_primeira": 30.0,
@@ -220,30 +299,6 @@ def salvar_config(cfg):
 # ===============================
 # FUNÇÕES UTILITÁRIAS
 # ===============================
-def normalizar_colunas(df):
-    """Normaliza os nomes das colunas do DataFrame"""
-    df = df.copy()
-    col_map = {
-        "Estufa": "area", "Área": "area", "Produção": "caixas", 
-        "Primeira": "caixas", "Segunda": "caixas_segunda", 
-        "Qtd": "caixas", "Quantidade": "caixas", "Data": "data",
-        "Observação": "observacao", "Observacoes": "observacao", "Obs": "observacao"
-    }
-    df.rename(columns={c: col_map.get(c, c) for c in df.columns}, inplace=True)
-    
-    if "data" in df.columns: 
-        df["data"] = pd.to_datetime(df["data"], errors="coerce").dt.strftime('%Y-%m-%d')
-    
-    for col in ["caixas", "caixas_segunda", "temperatura", "umidade", "chuva", "observacao"]:
-        if col not in df.columns: 
-            df[col] = 0 if col != "observacao" else ""
-    
-    for col in ["area", "cultura"]:
-        if col not in df.columns: 
-            df[col] = ""
-    
-    return df
-
 def buscar_clima(cidade):
     """Busca dados climáticos da API"""
     try:
@@ -278,39 +333,6 @@ def buscar_clima(cidade):
         return atual, pd.DataFrame(previsao)
     except:
         return None, None
-
-def calcular_estagio_fenologico(data_plantio, especie=None):
-    """Calcula o estágio fenológico com base na data de plantio"""
-    if not data_plantio:
-        return "Não especificado"
-        
-    try:
-        dias = (datetime.now() - datetime.strptime(data_plantio, "%Y-%m-%d")).days
-        estagios = config["fenologia_padrao"]["estagios"]
-        
-        if especie and especie in fenologia_especies:
-            estagios = fenologia_especies[especie]
-        
-        for estagio in estagios:
-            dias_range = estagio["dias"].split("-")
-            if len(dias_range) == 2 and dias >= int(dias_range[0]) and dias <= int(dias_range[1]):
-                return estagio["nome"]
-                
-        return "Colheita concluída"
-    except:
-        return "Data inválida"
-
-def recomendar_adubacao(estagio, especie=None):
-    """Retorna recomendação de adubação baseada no estágio fenológico"""
-    estagios = config["fenologia_padrao"]["estagios"]
-    if especie and especie in fenologia_especies:
-        estagios = fenologia_especies[especie]
-    
-    for e in estagios:
-        if e["nome"] == estagio:
-            return f"Recomendado: {e['adubo']}kg/ha de adubo e {e['agua']}L/planta de água"
-    
-    return "Sem recomendação específica"
 
 # ===============================
 # FUNÇÕES UTILITÁRIAS PARA CÁLCULO
@@ -406,6 +428,24 @@ DADOS_AGRONOMICOS = {
         "doencas_comuns": ["oidio", "antracnose", "murcha-bacteriana"],
         "preco_sugerido_primeira": 20.0,
         "preco_sugerido_segunda": 10.0
+    },
+    "Alface": {
+        "densidade_plantio": 60000, "espacamento": "25x25 cm", "producao_esperada": 0.3,
+        "ciclo_dias": 45, "temp_ideal": [15, 25], "umidade_ideal": [70, 85], "ph_ideal": [6.0, 7.0],
+        "adubacao_base": {"N": 80, "P": 40, "K": 60},
+        "pragas_comuns": ["pulgão", "lagarta", "vaquinha"],
+        "doencas_comuns": ["podridão-mole", "queima-das-folhas", "míldio"],
+        "preco_sugerido_primeira": 12.0,
+        "preco_sugerido_segunda": 6.0
+    },
+    "Couve": {
+        "densidade_plantio": 30000, "espacamento": "40x40 cm", "producao_esperada": 0.4,
+        "ciclo_dias": 60, "temp_ideal": [15, 25], "umidade_ideal": [65, 80], "ph_ideal": [6.0, 7.0],
+        "adubacao_base": {"N": 100, "P": 50, "K": 80},
+        "pragas_comuns": ["lagarta", "pulgão", "besouro"],
+        "doencas_comuns": ["mancha-das-folhas", "podridão-negra", "oidio"],
+        "preco_sugerido_primeira": 15.0,
+        "preco_sugerido_segunda": 7.5
     }
 }
 
@@ -450,22 +490,17 @@ def gerar_recomendacoes_clima(cultura, dados_clima):
     
     return recomendacoes
 
-def recomendar_adubacao_especifica(cultura, area_m2, estagio_fenologico):
-    """Recomenda adubação específica baseada na cultura e estágio"""
+def recomendar_adubacao_especifica(cultura, area_m2):
+    """Recomenda adubação específica baseada na cultura"""
     if cultura not in DADOS_AGRONOMICOS:
         return None
     
     dados = DADOS_AGRONOMICOS[cultura]
     area_ha = area_m2 / 10000
     
-    fator_estagio = {
-        "Germinação/Vegetativo": 0.6, "Floração": 1.0,
-        "Frutificação": 0.8, "Maturação": 0.4
-    }.get(estagio_fenologico, 1.0)
-    
     recomendacao = {}
     for nutriente, quantidade in dados['adubacao_base'].items():
-        recomendacao[nutriente] = round(quantidade * area_ha * fator_estagio, 2)
+        recomendacao[nutriente] = round(quantidade * area_ha, 2)
     
     return recomendacao
 
@@ -556,7 +591,6 @@ def mostrar_modulo_agronomico():
         col1, col2 = st.columns(2)
         with col1:
             temperatura = st.slider("Temperatura atual (°C):", 0.0, 40.0, 25.0)
-            estagio = st.selectbox("Estágio fenológico:", ["Germinação/Vegetativo", "Floração", "Frutificação", "Maturação"])
         
         with col2:
             umidade = st.slider("Umidade relativa (%):", 0.0, 100.0, 70.0)
@@ -569,7 +603,7 @@ def mostrar_modulo_agronomico():
                 for rec in rec_clima:
                     st.write(f"- {rec}")
             
-            adubacao = recomendar_adubacao_especifica(cultura, area, estagio)
+            adubacao = recomendar_adubacao_especifica(cultura, area)
             if adubacao:
                 st.success("**Recomendação de Adubação:**")
                 st.write(f"- Nitrogênio (N): {adubacao['N']} kg/ha")
@@ -1160,24 +1194,37 @@ def pagina_analise():
             
             with col1:
                 custos_tipo = df_ins_filtrado.groupby('tipo')['custo_total'].sum().reset_index()
-                fig = px.pie(custos_tipo, values='custo_total', names='tipo',
-                            title='📊 Distribuição de Custos por Tipo')
-                st.plotly_chart(fig, use_container_width=True)
+                if not custos_tipo.empty:
+                    fig = px.pie(custos_tipo, values='custo_total', names='tipo',
+                                title='📊 Distribuição de Custos por Tipo')
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("ℹ️ Nenhum dado de custos disponível para análise")
             
             with col2:
-                custos_cultura = df_ins_filtrado.groupby('cultura')['custo_total'].sum().reset_index()
-                fig = px.bar(custos_cultura, x='cultura', y='custo_total',
-                            title='🌱 Custos por Cultura')
-                st.plotly_chart(fig, use_container_width=True)
+                # Verificar se a coluna 'cultura' existe nos insumos
+                if 'cultura' in df_ins_filtrado.columns:
+                    custos_cultura = df_ins_filtrado.groupby('cultura')['custo_total'].sum().reset_index()
+                    if not custos_cultura.empty:
+                        fig = px.bar(custos_cultura, x='cultura', y='custo_total',
+                                    title='🌱 Custos por Cultura')
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("ℹ️ Nenhum dado de custos por cultura disponível")
+                else:
+                    st.info("ℹ️ A coluna 'cultura' não está disponível nos dados de insumos")
         
         with tab2:
             custos_mensal = df_ins_filtrado.copy()
             custos_mensal['mes'] = custos_mensal['data'].dt.to_period('M').astype(str)
             custos_mensal = custos_mensal.groupby('mes')['custo_total'].sum().reset_index()
             
-            fig = px.line(custos_mensal, x='mes', y='custo_total',
-                         title='📈 Evolução Mensal de Custos', markers=True)
-            st.plotly_chart(fig, use_container_width=True)
+            if not custos_mensal.empty:
+                fig = px.line(custos_mensal, x='mes', y='custo_total',
+                             title='📈 Evolução Mensal de Custos', markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("ℹ️ Nenhum dado de custos disponível para análise temporal")
         
         with tab3:
             if not df_prod_filtrado.empty:
@@ -1186,10 +1233,15 @@ def pagina_analise():
                 for cultura in df_prod_filtrado['cultura'].unique():
                     if cultura and cultura.strip():
                         df_cultura_prod = df_prod_filtrado[df_prod_filtrado['cultura'] == cultura]
-                        df_cultura_ins = df_ins_filtrado[df_ins_filtrado['cultura'] == cultura]
+                        
+                        # Verificar se a coluna 'cultura' existe nos insumos
+                        if 'cultura' in df_ins_filtrado.columns:
+                            df_cultura_ins = df_ins_filtrado[df_ins_filtrado['cultura'] == cultura]
+                            custo_total = df_cultura_ins['custo_total'].sum() if not df_cultura_ins.empty else 0
+                        else:
+                            custo_total = 0
                         
                         rec_primeira, rec_segunda, rec_total = calcular_receita_total(df_cultura_prod)
-                        custo_total = df_cultura_ins['custo_total'].sum() if not df_cultura_ins.empty else 0
                         lucro = rec_total - custo_total
                         
                         if custo_total > 0:
@@ -1260,10 +1312,15 @@ def pagina_analise():
         for cultura in df_prod_filtrado['cultura'].unique():
             if cultura and cultura.strip():
                 df_cultura_prod = df_prod_filtrado[df_prod_filtrado['cultura'] == cultura]
-                df_cultura_ins = df_ins_filtrado[df_ins_filtrado['cultura'] == cultura]
+                
+                # Verificar se a coluna 'cultura' existe nos insumos
+                if 'cultura' in df_ins_filtrado.columns:
+                    df_cultura_ins = df_ins_filtrado[df_ins_filtrado['cultura'] == cultura]
+                    custo_total = df_cultura_ins['custo_total'].sum() if not df_cultura_ins.empty else 0
+                else:
+                    custo_total = 0
                 
                 rec_primeira, rec_segunda, rec_total = calcular_receita_total(df_cultura_prod)
-                custo_total = df_cultura_ins['custo_total'].sum() if not df_cultura_ins.empty else 0
                 lucro = rec_total - custo_total
                 
                 if custo_total > 0:
@@ -1279,9 +1336,10 @@ def pagina_analise():
         
         if rentabilidade_data:
             df_rentabilidade = pd.DataFrame(rentabilidade_data)
-            cultura_lucrativa = df_rentabilidade.nlargest(1, 'ROI')['Cultura'].iloc[0]
-            roi_max = df_rentabilidade.nlargest(1, 'ROI')['ROI'].iloc[0]
-            insights.append(f"✅ **{cultura_lucrativa}** é a cultura mais rentável (ROI: {roi_max:.1f}%)")
+            if not df_rentabilidade.empty:
+                cultura_lucrativa = df_rentabilidade.nlargest(1, 'ROI')['Cultura'].iloc[0]
+                roi_max = df_rentabilidade.nlargest(1, 'ROI')['ROI'].iloc[0]
+                insights.append(f"✅ **{cultura_lucrativa}** é a cultura mais rentável (ROI: {roi_max:.1f}%)")
     
     if 'pct_segunda' in locals() and pct_segunda > config.get('alerta_pct_segunda', 25):
         insights.append(f"⚠️ **Alerta**: Percentual de 2ª qualidade ({pct_segunda:.1f}%) acima do limite recomendado")
@@ -1308,7 +1366,7 @@ def pagina_configuracoes():
     """Página de configurações do sistema"""
     st.title("⚙️ Configurações do Sistema")
     
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Geral", "Fenologia", "Preços Culturas", "Custos Insumos", "Fenologia por Espécie"])
+    tab1, tab2, tab3 = st.tabs(["Geral", "Preços Culturas", "Custos Insumos"])
     
     with tab1:
         st.subheader("Configurações Gerais")
@@ -1329,32 +1387,6 @@ def pagina_configuracoes():
                                        value=float(config.get("preco_padrao_segunda", 15.0)))
     
     with tab2:
-        st.subheader("Estágios Fenológicos Padrão")
-        st.info("Configure os estágios de desenvolvimento padrão para culturas sem configuração específica")
-        
-        estagios = config.get("fenologia_padrao", {}).get("estagios", [])
-        novos_estagios = []
-        
-        for i, estagio in enumerate(estagios):
-            st.markdown(f"**Estágio {i+1}**")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                nome = st.text_input("Nome", value=estagio.get("nome", ""), key=f"nome_{i}")
-            with col2:
-                dias = st.text_input("Duração (dias)", value=estagio.get("dias", ""), key=f"dias_{i}")
-            with col3:
-                adubo = st.number_input("Adubo (kg/ha)", value=float(estagio.get("adubo", 0)), key=f"adubo_{i}")
-            with col4:
-                agua = st.number_input("Água (L/planta)", value=float(estagio.get("agua", 0)), key=f"agua_{i}")
-            
-            novos_estagios.append({"nome": nome, "dias": dias, "adubo": adubo, "agua": agua})
-        
-        if st.button("Adicionar estágio padrão"):
-            novos_estagios.append({"nome": "Novo Estágio", "dias": "0-0", "adubo": 0.0, "agua": 0.0})
-        
-        config["fenologia_padrao"]["estagios"] = novos_estagios
-    
-    with tab3:
         st.subheader("Preços por Cultura")
         st.info("Configure os preços específicos para cada cultura")
         
@@ -1404,7 +1436,7 @@ def pagina_configuracoes():
             df_precos = pd.DataFrame(precos_lista)
             st.dataframe(df_precos, use_container_width=True)
     
-    with tab4:
+    with tab3:
         st.subheader("Custos Médios de Insumos")
         st.info("Configure os preços de referência para cada tipo de insumo")
         
@@ -1417,53 +1449,6 @@ def pagina_configuracoes():
             novos_custos[tipo] = novo_valor
         
         config["custo_medio_insumos"] = novos_custos
-    
-    with tab5:
-        st.subheader("Fenologia por Espécie")
-        st.info("Configure estágios fenológicos específicos para cada espécie")
-        
-        especies_existentes = list(fenologia_especies.keys())
-        nova_especie = st.text_input("Nova espécie")
-        
-        if nova_especie and nova_especie not in especies_existentes:
-            if st.button("Adicionar nova espécie"):
-                fenologia_especies[nova_especie] = config["fenologia_padrao"]["estagios"].copy()
-                salvar_fenologia_especie(nova_especie, fenologia_especies[nova_especie])
-                st.success(f"Espécie {nova_especie} adicionada!")
-                st.rerun()
-        
-        especie_selecionada = st.selectbox(
-            "Selecionar espécie para editar",
-            options=especies_existentes,
-            index=0 if especies_existentes else None
-        )
-        
-        if especie_selecionada:
-            estagios_especie = fenologia_especies[especie_selecionada]
-            st.markdown(f"### Estágios fenológicos para {especie_selecionada}")
-            
-            novos_estagios = []
-            for i, estagio in enumerate(estagios_especie):
-                st.markdown(f"**Estágio {i+1}**")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    nome = st.text_input("Nome", value=estagio.get("nome", ""), key=f"esp_nome_{especie_selecionada}_{i}")
-                with col2:
-                    dias = st.text_input("Duração (dias)", value=estagio.get("dias", ""), key=f"esp_dias_{especie_selecionada}_{i}")
-                with col3:
-                    adubo = st.number_input("Adubo (kg/ha)", value=float(estagio.get("adubo", 0)), key=f"esp_adubo_{especie_selecionada}_{i}")
-                with col4:
-                    agua = st.number_input("Água (L/planta)", value=float(estagio.get("agua", 0)), key=f"esp_agua_{especie_selecionada}_{i}")
-                
-                novos_estagios.append({"nome": nome, "dias": dias, "adubo": adubo, "agua": agua})
-            
-            if st.button(f"Adicionar estágio para {especie_selecionada}"):
-                novos_estagios.append({"nome": "Novo Estágio", "dias": "0-0", "adubo": 0.0, "agua": 0.0})
-            
-            if st.button(f"Salvar estágios para {especie_selecionada}"):
-                fenologia_especies[especie_selecionada] = novos_estagios
-                salvar_fenologia_especie(especie_selecionada, novos_estagios)
-                st.success(f"Estágios para {especie_selecionada} salvos com sucesso!")
     
     if st.button("Salvar Configurações Gerais"):
         config["cidade"] = cidade_new
@@ -1481,9 +1466,8 @@ def main():
     """Função principal da aplicação"""
     # Inicialização
     criar_tabelas()
-    global config, fenologia_especies, precos_culturas
+    global config, precos_culturas
     config = carregar_config()
-    fenologia_especies = carregar_fenologia_especies()
     precos_culturas = carregar_precos_culturas()
     
     # Sidebar
