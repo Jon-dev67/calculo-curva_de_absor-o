@@ -10,3 +10,4 @@ reportlab
 xlsxwriter
 scipy
 statsmodels
+sklearn
