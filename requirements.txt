@@ -8,5 +8,5 @@ requests
 openpyxl
 reportlab
 xlsxwriter
-scipy==1.11.2
-statsmodels==0.14.0
+scipy
+statsmodels
