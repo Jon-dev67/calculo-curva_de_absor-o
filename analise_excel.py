@@ -24,7 +24,7 @@ plt.style.use("dark_background")
 ARQUIVO_DADOS = "colheitas.xlsx"
 ARQUIVO_INSUMOS = "insumos.xlsx"
 ARQUIVO_CONFIG = "config_precos.json"
-API_KEY = "sua_chave_openweather_aqui"  # Substitua pela sua chave real
+API_KEY = "eef20bca4e6fb1ff14a81a3171de5cec" 
 CIDADE_PADRAO = "Londrina"
 
 # ================================
