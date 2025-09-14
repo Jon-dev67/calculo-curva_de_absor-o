@@ -4,13 +4,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import requests
 import urllib.parse
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 import json
 import numpy as np
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -27,7 +24,7 @@ plt.style.use("dark_background")
 ARQUIVO_DADOS = "colheitas.xlsx"
 ARQUIVO_INSUMOS = "insumos.xlsx"
 ARQUIVO_CONFIG = "config_precos.json"
-API_KEY = "eef20bca4e6fb1ff14a81a3171de5cec"  
+API_KEY = "sua_chave_openweather_aqui"  # Substitua pela sua chave real
 CIDADE_PADRAO = "Londrina"
 
 # ================================
@@ -113,55 +110,36 @@ def clima_atual(cidade):
     except:
         return None
 
-def analisar_tendencias_ia(df):
-    """Analisa tendências usando IA"""
-    if len(df) < 10:
-        return {"mensagem": "Dados insuficientes para análise (mínimo 10 registros)"}
+def analisar_tendencias_simples(df):
+    """Analisa tendências usando métodos estatísticos simples"""
+    if len(df) < 5:
+        return {"mensagem": "Dados insuficientes para análise (mínimo 5 registros)"}
     
     try:
-        # Preparar dados para ML
-        df_ml = df.copy()
-        df_ml['Mes'] = df_ml['Data'].dt.month
-        df_ml['Dia'] = df_ml['Data'].dt.day
+        # Análise de tendência temporal
+        df_temporal = df.copy()
+        df_temporal['Mes'] = df_temporal['Data'].dt.to_period('M')
+        tendencia_mensal = df_temporal.groupby('Mes')['Total'].sum().pct_change().mean() * 100
         
-        # Codificar variáveis categóricas
-        le_local = LabelEncoder()
-        le_produto = LabelEncoder()
-        df_ml['Local_encoded'] = le_local.fit_transform(df_ml['Local'])
-        df_ml['Produto_encoded'] = le_produto.fit_transform(df_ml['Produto'])
+        # Correlações simples
+        correlacoes = {
+            "temp_producao": df['Temperatura'].corr(df['Total']),
+            "umidade_producao": df['Umidade'].corr(df['Total']),
+            "chuva_producao": df['Chuva'].corr(df['Total'])
+        }
         
-        # Features e target
-        X = df_ml[['Mes', 'Dia', 'Local_encoded', 'Produto_encoded', 'Temperatura', 'Umidade']]
-        y = df_ml['Total']
-        
-        # Modelo de regressão
-        model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(X, y)
-        
-        # Importância das features
-        feature_importance = dict(zip(['Mes', 'Dia', 'Local', 'Produto', 'Temperatura', 'Umidade'], 
-                                     model.feature_importances_))
-        
-        # Previsão para próximo mês
-        ultima_data = df_ml['Data'].max()
-        proximo_mes = ultima_data.month + 1 if ultima_data.month < 12 else 1
-        previsao_features = pd.DataFrame({
-            'Mes': [proximo_mes] * len(df_ml['Local_encoded'].unique()),
-            'Dia': [15] * len(df_ml['Local_encoded'].unique()),
-            'Local_encoded': df_ml['Local_encoded'].unique(),
-            'Produto_encoded': [df_ml['Produto_encoded'].mode()[0]] * len(df_ml['Local_encoded'].unique()),
-            'Temperatura': [df_ml['Temperatura'].mean()] * len(df_ml['Local_encoded'].unique()),
-            'Umidade': [df_ml['Umidade'].mean()] * len(df_ml['Local_encoded'].unique())
-        })
-        
-        previsoes = model.predict(previsao_features)
-        previsao_total = previsoes.sum()
+        # Previsão simples baseada na média móvel
+        if len(df) >= 3:
+            media_movel = df['Total'].rolling(window=3).mean().iloc[-1]
+            previsao = media_movel * 30  # Estimativa mensal
+        else:
+            previsao = df['Total'].mean() * 30
         
         return {
-            "feature_importance": feature_importance,
-            "previsao_proximo_mes": previsao_total,
-            "acuracia": model.score(X, y),
-            "tendencia": "Crescimento" if previsao_total > y.mean() * len(df_ml['Local_encoded'].unique()) else "Estabilidade"
+            "tendencia_mensal": tendencia_mensal,
+            "correlacoes": correlacoes,
+            "previsao_mensal": previsao,
+            "status": "Crescimento" if tendencia_mensal > 0 else "Queda" if tendencia_mensal < 0 else "Estável"
         }
     except Exception as e:
         return {"erro": f"Erro na análise: {str(e)}"}
@@ -170,25 +148,30 @@ def calcular_balanco(df_colheitas, df_insumos, config):
     """Calcula balanço financeiro"""
     receita_primeira = df_colheitas['Caixas'].sum() * config['preco_primeira']
     receita_segunda = df_colheitas['Caixas de Segunda'].sum() * config['preco_segunda']
-    custos_insumos = df_insumos['Custo'].sum()
+    custos_insumos = df_insumos['Custo'].sum() if not df_insumos.empty else 0
     custos_totais = custos_insumos + config['custos_fixos']
     
+    receita_total = receita_primeira + receita_segunda
+    lucro = receita_total - custos_totais
+    margem_lucro = (lucro / receita_total * 100) if receita_total > 0 else 0
+    
     return {
-        "receita_total": receita_primeira + receita_segunda,
+        "receita_total": receita_total,
         "receita_primeira": receita_primeira,
         "receita_segunda": receita_segunda,
         "custos_insumos": custos_insumos,
         "custos_fixos": config['custos_fixos'],
         "custos_totais": custos_totais,
-        "lucro": (receita_primeira + receita_segunda) - custos_totais,
-        "margem_lucro": ((receita_primeira + receita_segunda) - custos_totais) / (receita_primeira + receita_segunda) * 100 if (receita_primeira + receita_segunda) > 0 else 0
+        "lucro": lucro,
+        "margem_lucro": margem_lucro
     }
 
 # ================================
 # MENU PRINCIPAL
 # ================================
 st.sidebar.title("📌 Menu")
-pagina = st.sidebar.radio("Escolha a página:", ["Cadastro de Produção","Cadastro de Insumos","Análise","Configurações"])
+pagina = st.sidebar.radio("Escolha a página:", 
+                         ["Cadastro de Produção", "Cadastro de Insumos", "Análise", "Configurações"])
 
 # ================================
 # PÁGINA CADASTRO DE PRODUÇÃO
@@ -199,7 +182,7 @@ if pagina == "Cadastro de Produção":
     cidade = st.sidebar.text_input("🌍 Cidade para clima", value=CIDADE_PADRAO)
 
     with st.form("form_cadastro", clear_on_submit=True):
-        col1,col2,col3 = st.columns(3)
+        col1, col2, col3 = st.columns(3)
         with col1:
             data = st.date_input("Data", value=date.today())
             local = st.text_input("Local/Estufa")
@@ -217,9 +200,10 @@ if pagina == "Cadastro de Produção":
             chuva = clima["chuva"]
             st.info(f"Clima carregado: 🌡️ {temperatura}°C | 💧 {umidade}% | 🌧️ {chuva}mm")
         else:
-            temperatura = st.number_input("Temperatura (°C)", min_value=0.0, step=0.1)
-            umidade = st.number_input("Umidade (%)", min_value=0.0, step=0.1)
-            chuva = st.number_input("Chuva (mm)", min_value=0.0, step=0.1)
+            st.warning("Não foi possível carregar dados climáticos automaticamente")
+            temperatura = st.number_input("Temperatura (°C)", min_value=0.0, step=0.1, value=25.0)
+            umidade = st.number_input("Umidade (%)", min_value=0.0, step=0.1, value=60.0)
+            chuva = st.number_input("Chuva (mm)", min_value=0.0, step=0.1, value=0.0)
 
         enviado = st.form_submit_button("Salvar Registro ✅")
         if enviado:
@@ -315,7 +299,7 @@ elif pagina == "Configurações":
 # PÁGINA ANÁLISE
 # ================================
 elif pagina == "Análise":
-    st.title("📊 Análise Avançada com IA")
+    st.title("📊 Análise Avançada")
     st.markdown("Escolha a fonte de dados:")
     fonte = st.radio("Fonte de dados:", ["Usar dados cadastrados no app","Enviar um arquivo Excel"], horizontal=True)
 
@@ -337,7 +321,7 @@ elif pagina == "Análise":
     st.sidebar.markdown("## 🔎 Filtros")
     min_date = df_norm["Data"].min().date() if not df_norm["Data"].isna().all() else date.today()
     max_date = df_norm["Data"].max().date() if not df_norm["Data"].isna().all() else date.today()
-    date_range = st.sidebar.date_input("Período", value=(min_date,max_date), min_value=min_date, max_value=max_date)
+    date_range = st.sidebar.date_input("Período", value=(min_date, max_date), min_value=min_date, max_value=max_date)
 
     locais_all = sorted(df_norm["Local"].dropna().unique())
     locais_sel = st.sidebar.multiselect("Local (todos se vazio)", locais_all, default=locais_all)
@@ -369,7 +353,7 @@ elif pagina == "Análise":
     maior = df_filt["Total"].max()
     menor = df_filt["Total"].min()
 
-    k1,k2,k3,k4 = st.columns(4)
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("Total de Caixas", f"{total:,.0f}")
     k2.metric("Média por Registro", f"{media:,.2f}")
     k3.metric("Máximo em 1 Registro", f"{maior:,.0f}")
@@ -380,30 +364,32 @@ elif pagina == "Análise":
     # GRÁFICOS BÁSICOS
     st.subheader("🏭 Total por Local")
     fig, ax = plt.subplots(figsize=(12,6))
-    plot_bar(ax,"Local","Total",df_filt,cores=sns.color_palette("tab20", n_colors=len(df_filt["Local"].unique())),
+    plot_bar(ax, "Local", "Total", df_filt, 
+             cores=sns.color_palette("tab20", n_colors=len(df_filt["Local"].unique())),
              titulo="Total de Caixas por Local", ylabel="Total de Caixas")
     st.pyplot(fig)
 
     st.subheader("🍅 Total por Produto")
     fig, ax = plt.subplots(figsize=(10,5))
-    plot_bar(ax,"Produto","Total",df_filt,cores=sns.color_palette("Set2", n_colors=len(df_filt["Produto"].unique())),
+    plot_bar(ax, "Produto", "Total", df_filt,
+             cores=sns.color_palette("Set2", n_colors=len(df_filt["Produto"].unique())),
              titulo="Total de Caixas por Produto", ylabel="Total de Caixas")
     st.pyplot(fig)
 
     # Comparativo 1ª vs 2ª
     st.subheader("📊 Comparativo Caixas 1ª vs 2ª")
-    for tipo in ["Local","Produto"]:
+    for tipo in ["Local", "Produto"]:
         if tipo in df_filt.columns:
-            df_comp = df_filt.groupby(tipo)[["Caixas","Caixas de Segunda"]].sum().reset_index()
+            df_comp = df_filt.groupby(tipo)[["Caixas", "Caixas de Segunda"]].sum().reset_index()
             fig, ax = plt.subplots(figsize=(12,6))
             df_comp.plot(kind="bar", x=tipo, ax=ax, width=0.7)
             ax.set_ylabel("Quantidade de Caixas")
             ax.set_title(f"Caixas de Primeira vs Segunda por {tipo}")
             ax.grid(axis="y")
-            ax.legend(["Caixas (1ª)","Caixas de Segunda"])
+            ax.legend(["Caixas (1ª)", "Caixas de Segunda"])
             ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
             for p in ax.patches:
-                ax.text(p.get_x()+p.get_width()/2,p.get_height()+max(df_filt["Total"])*0.01,f'{int(p.get_height())}',ha='center')
+                ax.text(p.get_x()+p.get_width()/2, p.get_height()+max(df_filt["Total"])*0.01, f'{int(p.get_height())}', ha='center')
             st.pyplot(fig)
 
     # Percentual 2ª linha
@@ -412,7 +398,7 @@ elif pagina == "Análise":
 
     # Por Produto
     df_prod_pct = (
-        df_filt.groupby("Produto")[["Caixas","Caixas de Segunda"]]
+        df_filt.groupby("Produto")[["Caixas", "Caixas de Segunda"]]
         .sum()
         .reset_index()
     )
@@ -422,12 +408,13 @@ elif pagina == "Análise":
     sns.barplot(data=df_prod_pct, x="Produto", y="Pct_2a", ax=ax, palette="viridis")
     ax.set_ylabel("% Caixas 2ª")
     ax.set_title("Percentual de Caixas de 2ª por Produto")
-    ax.bar_label(ax.containers[0], fmt="%.1f%%")
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.1f%%")
     st.pyplot(fig)
 
     # Por Local
     df_loc_pct = (
-        df_filt.groupby("Local")[["Caixas","Caixas de Segunda"]]
+        df_filt.groupby("Local")[["Caixas", "Caixas de Segunda"]]
         .sum()
         .reset_index()
     )
@@ -437,38 +424,46 @@ elif pagina == "Análise":
     sns.barplot(data=df_loc_pct, x="Local", y="Pct_2a", ax=ax, palette="mako")
     ax.set_ylabel("% Caixas 2ª")
     ax.set_title("Percentual de Caixas de 2ª por Local")
-    ax.bar_label(ax.containers[0], fmt="%.1f%%")
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.1f%%")
     st.pyplot(fig)
 
-    # ANÁLISE DE TENDÊNCIAS COM IA
+    # ANÁLISE DE TENDÊNCIAS SIMPLES
     st.markdown("---")
-    st.subheader("🤖 Análise de Tendências com IA")
+    st.subheader("📈 Análise de Tendências")
     
-    resultado_ia = analisar_tendencias_ia(df_filt)
+    resultado_analise = analisar_tendencias_simples(df_filt)
     
-    if "mensagem" in resultado_ia:
-        st.info(resultado_ia["mensagem"])
-    elif "erro" in resultado_ia:
-        st.error(resultado_ia["erro"])
+    if "mensagem" in resultado_analise:
+        st.info(resultado_analise["mensagem"])
+    elif "erro" in resultado_analise:
+        st.error(resultado_analise["erro"])
     else:
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Previsão Próximo Mês", f"{resultado_ia['previsao_proximo_mes']:,.0f} caixas")
+            st.metric("Tendência Mensal", f"{resultado_analise['tendencia_mensal']:.1f}%")
         with col2:
-            st.metric("Acurácia do Modelo", f"{resultado_ia['acuracia']*100:.1f}%")
+            st.metric("Previsão Mensal", f"{resultado_analise['previsao_mensal']:,.0f} caixas")
         with col3:
-            st.metric("Tendência", resultado_ia['tendencia'])
+            st.metric("Status", resultado_analise['status'])
         
-        # Importância das variáveis
-        st.subheader("📈 Importância das Variáveis na Produção")
-        importancia_df = pd.DataFrame({
-            'Variável': list(resultado_ia['feature_importance'].keys()),
-            'Importância': list(resultado_ia['feature_importance'].values())
-        }).sort_values('Importância', ascending=False)
+        # Correlações
+        st.subheader("🔗 Correlações com Fatores Climáticos")
+        correl_df = pd.DataFrame({
+            'Fator': ['Temperatura', 'Umidade', 'Chuva'],
+            'Correlação': [
+                resultado_analise['correlacoes']['temp_producao'],
+                resultado_analise['correlacoes']['umidade_producao'],
+                resultado_analise['correlacoes']['chuva_producao']
+            ]
+        })
         
         fig, ax = plt.subplots(figsize=(10, 6))
-        sns.barplot(data=importancia_df, x='Importância', y='Variável', ax=ax, palette='rocket')
-        ax.set_title('Importância das Variáveis na Previsão de Produção')
+        sns.barplot(data=correl_df, x='Fator', y='Correlação', ax=ax, palette='coolwarm')
+        ax.set_title('Correlação entre Fatores Climáticos e Produção')
+        ax.set_ylim(-1, 1)
+        for container in ax.containers:
+            ax.bar_label(container, fmt="%.2f")
         st.pyplot(fig)
 
     # BALANÇO FINANCEIRO
@@ -512,33 +507,6 @@ elif pagina == "Análise":
                 f'R$ {valor:,.2f}', ha='center')
     
     st.pyplot(fig)
-
-    # ANÁLISE DE CORRELAÇÃO COM FATORES CLIMÁTICOS
-    st.markdown("---")
-    st.subheader("🌤️ Correlação com Fatores Climáticos")
-    
-    try:
-        # Calcular correlações
-        correlacoes = df_filt[['Caixas', 'Caixas de Segunda', 'Total', 'Temperatura', 'Umidade', 'Chuva']].corr()
-        
-        fig, ax = plt.subplots(figsize=(10, 8))
-        sns.heatmap(correlacoes, annot=True, cmap='coolwarm', center=0, ax=ax)
-        ax.set_title('Matriz de Correlação entre Produção e Fatores Climáticos')
-        st.pyplot(fig)
-        
-        # Análise específica das correlações mais relevantes
-        st.markdown("#### 📋 Principais Correlações")
-        corr_total_temp = correlacoes.loc['Total', 'Temperatura']
-        corr_total_umid = correlacoes.loc['Total', 'Umidade']
-        corr_total_chuva = correlacoes.loc['Total', 'Chuva']
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Temperatura x Produção", f"{corr_total_temp:.2f}")
-        col2.metric("Umidade x Produção", f"{corr_total_umid:.2f}")
-        col3.metric("Chuva x Produção", f"{corr_total_chuva:.2f}")
-        
-    except Exception as e:
-        st.warning(f"Não foi possível calcular correlações: {str(e)}")
 
     # Download filtrado
     st.markdown("---")
