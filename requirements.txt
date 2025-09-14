@@ -1,5 +1,5 @@
-streamlit
-pandas
+streamlit>=1.32.0
+pandas>=2.0.0
 numpy
 matplotlib
 seaborn
@@ -8,6 +8,3 @@ requests
 openpyxl
 reportlab
 xlsxwriter
-scipy
-statsmodels
-sklearn
