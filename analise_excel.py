@@ -1,518 +1,1002 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
+import sqlite3
 import requests
 import urllib.parse
-from datetime import date, datetime, timedelta
-from io import BytesIO
 import json
-import numpy as np
-import warnings
-warnings.filterwarnings('ignore')
+import os
+from io import BytesIO
+from datetime import date, datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# ================================
+# ===============================
 # CONFIGURAÇÕES INICIAIS
-# ================================
-st.set_page_config(
-    page_title="🌱 Gerenciador Avançado de Produção",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# ===============================
+st.set_page_config(page_title="🌱 Gerenciador Integrado de Produção", layout="wide")
 plt.style.use("dark_background")
+sns.set_theme(style="darkgrid")
 
-ARQUIVO_DADOS = "colheitas.xlsx"
-ARQUIVO_INSUMOS = "insumos.xlsx"
-ARQUIVO_CONFIG = "config_precos.json"
-API_KEY = "eef20bca4e6fb1ff14a81a3171de5cec" 
+DB_NAME = "dados_sitio.db"
+CONFIG_FILE = "config.json"
+API_KEY = "eef20bca4e6fb1ff14a81a3171de5cec"  # OpenWeather API Key
 CIDADE_PADRAO = "Londrina"
 
-# ================================
-# FUNÇÕES AUXILIARES
-# ================================
-def carregar_dados():
-    try:
-        return pd.read_excel(ARQUIVO_DADOS)
-    except:
-        return pd.DataFrame(columns=["Data","Local","Produto","Caixas","Caixas de Segunda","Temperatura","Umidade","Chuva"])
+# Tipos de insumos pré-definidos para padronização
+TIPOS_INSUMOS = [
+    "Adubo Orgânico", "Adubo Químico", "Defensivo Agrícola", 
+    "Semente", "Muda", "Fertilizante Foliar", 
+    "Corretivo de Solo", "Insumo para Irrigação", "Outros"
+]
 
-def salvar_dados(df):
-    df.to_excel(ARQUIVO_DADOS, index=False)
+UNIDADES = ["kg", "g", "L", "mL", "unidade", "saco", "caixa", "pacote"]
 
-def carregar_insumos():
-    try:
-        return pd.read_excel(ARQUIVO_INSUMOS)
-    except:
-        return pd.DataFrame(columns=["Data", "Tipo", "Descricao", "Quantidade", "Unidade", "Custo", "Local"])
+# ===============================
+# BANCO DE DADOS
+# ===============================
+def criar_tabelas():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Tabela de produção
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS producao (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data TEXT,
+        estufa TEXT,
+        cultura TEXT,
+        caixas INTEGER,
+        caixas_segunda INTEGER,
+        temperatura REAL,
+        umidade REAL,
+        chuva REAL,
+        observacao TEXT
+    )
+    """)
+    
+    # Tabela de insumos (ampliada)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS insumos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data TEXT,
+        estufa TEXT,
+        cultura TEXT,
+        tipo TEXT,
+        quantidade REAL,
+        unidade TEXT,
+        custo_unitario REAL,
+        custo_total REAL,
+        fornecedor TEXT,
+        lote TEXT,
+        observacoes TEXT
+    )
+    """)
+    
+    # Nova tabela para custos operacionais
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS custos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data TEXT,
+        tipo TEXT,
+        descricao TEXT,
+        valor REAL,
+        area TEXT,
+        observacoes TEXT
+    )
+    """)
+    
+    conn.commit()
+    conn.close()
 
-def salvar_insumos(df):
-    df.to_excel(ARQUIVO_INSUMOS, index=False)
+def inserir_tabela(nome_tabela, df):
+    conn = sqlite3.connect(DB_NAME)
+    df.to_sql(nome_tabela, conn, if_exists="append", index=False)
+    conn.close()
 
-def carregar_config_precos():
-    try:
-        with open(ARQUIVO_CONFIG, 'r') as f:
-            return json.load(f)
-    except:
-        return {
-            "preco_primeira": 10.0,
-            "preco_segunda": 5.0,
-            "custos_fixos": 1000.0
+def carregar_tabela(nome_tabela):
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql(f"SELECT * FROM {nome_tabela}", conn)
+    conn.close()
+    return df
+
+def excluir_linha(nome_tabela, row_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(f"DELETE FROM {nome_tabela} WHERE id=?", (row_id,))
+    conn.commit()
+    conn.close()
+
+criar_tabelas()
+
+# ===============================
+# CONFIGURAÇÕES
+# ===============================
+def carregar_config():
+    if not os.path.exists(CONFIG_FILE):
+        cfg = {
+            "cidade": CIDADE_PADRAO,
+            "fenologia": {
+                "estagios": [
+                    {"nome": "Germinação/Vegetativo", "dias": "0-30", "adubo": 2.0, "agua": 1.5},
+                    {"nome": "Floração", "dias": "31-60", "adubo": 4.0, "agua": 2.0},
+                    {"nome": "Frutificação", "dias": "61-90", "adubo": 3.0, "agua": 2.5},
+                    {"nome": "Maturação", "dias": "91-120", "adubo": 1.0, "agua": 1.0}
+                ]
+            },
+            "alerta_pct_segunda": 25.0,
+            "alerta_prod_baixo_pct": 30.0,
+            "preco_medio_caixa": 30.0,
+            "custo_medio_insumos": {
+                "Adubo Orgânico": 2.5,
+                "Adubo Químico": 4.0,
+                "Defensivo Agrícola": 35.0,
+                "Semente": 0.5,
+                "Muda": 1.2,
+                "Fertilizante Foliar": 15.0,
+                "Corretivo de Solo": 1.8,
+                "Insumo para Irrigação": 0.0,
+                "Outros": 0.0
+            }
         }
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=4)
+        return cfg
+    
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def salvar_config_precos(config):
-    with open(ARQUIVO_CONFIG, 'w') as f:
-        json.dump(config, f)
+def salvar_config(cfg):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=4)
+
+config = carregar_config()
+
+# ===============================
+# FUNÇÕES UTILITÁRIAS
+# ===============================
+def buscar_clima(cidade):
+    try:
+        city_encoded = urllib.parse.quote(cidade)
+        url = f"https://api.openweathermap.org/data/2.5/weather?q={city_encoded}&appid={API_KEY}&units=metric&lang=pt_br"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if r.status_code != 200: 
+            return None, None
+        
+        atual = {
+            "temp": float(data["main"]["temp"]),
+            "umidade": float(data["main"]["humidity"]),
+            "chuva": float(data.get("rain", {}).get("1h", 0) or 0.0)
+        }
+        
+        # Previsão
+        url_forecast = f"https://api.openweathermap.org/data/2.5/forecast?q={city_encoded}&appid={API_KEY}&units=metric&lang=pt_br"
+        forecast = requests.get(url_forecast).json()
+        previsao = []
+        
+        if forecast.get("cod") == "200":
+            for item in forecast["list"]:
+                previsao.append({
+                    "Data": item["dt_txt"],
+                    "Temp Real (°C)": item["main"]["temp"],
+                    "Temp Média (°C)": (item["main"]["temp_min"] + item["main"]["temp_max"]) / 2,
+                    "Temp Min (°C)": item["main"]["temp_min"],
+                    "Temp Max (°C)": item["main"]["temp_max"],
+                    "Umidade (%)": item["main"]["humidity"]
+                })
+                
+        return atual, pd.DataFrame(previsao)
+    except:
+        return None, None
 
 def normalizar_colunas(df):
     df = df.copy()
     col_map = {
-        "Estufa":"Local",
-        "Área":"Local",
-        "Produção":"Caixas",
-        "Primeira":"Caixas",
-        "Segunda":"Caixas de Segunda",
-        "Qtd":"Caixas",
-        "Quantidade":"Caixas",
+        "Estufa": "estufa", "Área": "estufa", "Produção": "caixas", 
+        "Primeira": "caixas", "Segunda": "caixas_segunda", 
+        "Qtd": "caixas", "Quantidade": "caixas", "Data": "data"
     }
-    df.rename(columns={c:col_map.get(c,c) for c in df.columns}, inplace=True)
-    if "Data" in df.columns:
-        df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
-    for col in ["Caixas","Caixas de Segunda","Temperatura","Umidade","Chuva"]:
-        if col not in df.columns:
+    df.rename(columns={c: col_map.get(c, c) for c in df.columns}, inplace=True)
+    
+    if "data" in df.columns: 
+        df["data"] = pd.to_datetime(df["data"], errors="coerce").dt.strftime('%Y-%m-%d')
+    
+    for col in ["caixas", "caixas_segunda", "temperatura", "umidade", "chuva"]:
+        if col not in df.columns: 
             df[col] = 0
-    if "Local" not in df.columns: df["Local"] = ""
-    if "Produto" not in df.columns: df["Produto"] = ""
+    
+    if "estufa" not in df.columns: 
+        df["estufa"] = ""
+    
+    if "cultura" not in df.columns: 
+        df["cultura"] = ""
+    
     return df
 
-def plot_bar(ax, x, y, df, cores, titulo, ylabel):
-    df.groupby(x)[y].sum().plot(kind="bar", ax=ax, color=cores, width=0.6)
+def plot_bar_sum(ax, df, x, y, titulo, ylabel, palette="tab20"):
+    if df.empty:
+        ax.set_axis_off()
+        return
+        
+    g = df.groupby(x)[y].sum().reset_index()
+    if g.empty: 
+        ax.set_axis_off()
+        return
+        
+    sns.barplot(data=g, x=x, y=y, ax=ax, palette=palette)
     ax.set_title(titulo, fontsize=14)
     ax.set_ylabel(ylabel)
-    ax.grid(axis="y", linestyle="--", alpha=0.7)
-    for p in ax.patches:
-        ax.text(p.get_x() + p.get_width()/2, p.get_height() + 0.01*df[y].max(), 
-                f"{int(p.get_height())}", ha="center")
+    ax.set_xlabel("")
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    
+    for c in ax.containers: 
+        ax.bar_label(c, fmt="%.0f")
 
-def clima_atual(cidade):
-    """Busca clima atual no OpenWeather"""
+def calcular_estagio_fenologico(data_plantio):
+    """Calcula o estágio fenológico com base na data de plantio"""
+    if not data_plantio:
+        return "Não especificado"
+        
     try:
-        city_encoded = urllib.parse.quote(cidade)
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={city_encoded}&appid={API_KEY}&units=metric&lang=pt_br"
-        r = requests.get(url)
-        data = r.json()
-        if r.status_code != 200:
-            return None
-        return {
-            "temp": data["main"]["temp"],
-            "umidade": data["main"]["humidity"],
-            "chuva": data.get("rain", {}).get("1h", 0)
-        }
+        dias = (datetime.now() - datetime.strptime(data_plantio, "%Y-%m-%d")).days
+        
+        for estagio in config["fenologia"]["estagios"]:
+            dias_range = estagio["dias"].split("-")
+            if len(dias_range) == 2 and dias >= int(dias_range[0]) and dias <= int(dias_range[1]):
+                return estagio["nome"]
+                
+        return "Colheita concluída"
     except:
-        return None
+        return "Data inválida"
 
-def analisar_tendencias_simples(df):
-    """Analisa tendências usando métodos estatísticos simples"""
-    if len(df) < 5:
-        return {"mensagem": "Dados insuficientes para análise (mínimo 5 registros)"}
+def recomendar_adubacao(estagio):
+    """Retorna recomendação de adubação baseada no estágio fenológico"""
+    for e in config["fenologia"]["estagios"]:
+        if e["nome"] == estagio:
+            return f"Recomendado: {e['adubo']}kg/ha de adubo e {e['agua']}L/planta de água"
     
-    try:
-        # Análise de tendência temporal
-        df_temporal = df.copy()
-        df_temporal['Mes'] = df_temporal['Data'].dt.to_period('M')
-        tendencia_mensal = df_temporal.groupby('Mes')['Total'].sum().pct_change().mean() * 100
-        
-        # Correlações simples
-        correlacoes = {
-            "temp_producao": df['Temperatura'].corr(df['Total']),
-            "umidade_producao": df['Umidade'].corr(df['Total']),
-            "chuva_producao": df['Chuva'].corr(df['Total'])
-        }
-        
-        # Previsão simples baseada na média móvel
-        if len(df) >= 3:
-            media_movel = df['Total'].rolling(window=3).mean().iloc[-1]
-            previsao = media_movel * 30  # Estimativa mensal
-        else:
-            previsao = df['Total'].mean() * 30
-        
-        return {
-            "tendencia_mensal": tendencia_mensal,
-            "correlacoes": correlacoes,
-            "previsao_mensal": previsao,
-            "status": "Crescimento" if tendencia_mensal > 0 else "Queda" if tendencia_mensal < 0 else "Estável"
-        }
-    except Exception as e:
-        return {"erro": f"Erro na análise: {str(e)}"}
+    return "Sem recomendação específica"
 
-def calcular_balanco(df_colheitas, df_insumos, config):
-    """Calcula balanço financeiro"""
-    receita_primeira = df_colheitas['Caixas'].sum() * config['preco_primeira']
-    receita_segunda = df_colheitas['Caixas de Segunda'].sum() * config['preco_segunda']
-    custos_insumos = df_insumos['Custo'].sum() if not df_insumos.empty else 0
-    custos_totais = custos_insumos + config['custos_fixos']
-    
-    receita_total = receita_primeira + receita_segunda
-    lucro = receita_total - custos_totais
-    margem_lucro = (lucro / receita_total * 100) if receita_total > 0 else 0
-    
-    return {
-        "receita_total": receita_total,
-        "receita_primeira": receita_primeira,
-        "receita_segunda": receita_segunda,
-        "custos_insumos": custos_insumos,
-        "custos_fixos": config['custos_fixos'],
-        "custos_totais": custos_totais,
-        "lucro": lucro,
-        "margem_lucro": margem_lucro
-    }
-
-# ================================
-# MENU PRINCIPAL
-# ================================
-st.sidebar.title("📌 Menu")
+# ===============================
+# SIDEBAR / MENU
+# ===============================
+st.sidebar.title("📌 Menu Navegação")
 pagina = st.sidebar.radio("Escolha a página:", 
-                         ["Cadastro de Produção", "Cadastro de Insumos", "Análise", "Configurações"])
+                         ["Dashboard", "Cadastro Produção", "Cadastro Insumos", "Análise", "Configurações"])
 
-# ================================
-# PÁGINA CADASTRO DE PRODUÇÃO
-# ================================
-if pagina == "Cadastro de Produção":
-    st.title("📝 Cadastro de Produção")
-    df = carregar_dados()
-    cidade = st.sidebar.text_input("🌍 Cidade para clima", value=CIDADE_PADRAO)
-
-    with st.form("form_cadastro", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
+# ===============================
+# PÁGINA: DASHBOARD
+# ===============================
+if pagina == "Dashboard":
+    st.title("🌱 Dashboard de Produção")
+    
+    # Carregar dados
+    df_prod = carregar_tabela("producao")
+    df_ins = carregar_tabela("insumos")
+    
+    # KPIs principais
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_caixas = df_prod["caixas"].sum() if not df_prod.empty else 0
+        total_segunda = df_prod["caixas_segunda"].sum() if not df_prod.empty else 0
+        st.metric("📦 Caixas 1ª Qualidade", f"{total_caixas:.0f}")
+    
+    with col2:
+        st.metric("🔄 Caixas 2ª Qualidade", f"{total_segunda:.0f}")
+    
+    with col3:
+        total_insumos = df_ins["custo_total"].sum() if not df_ins.empty else 0
+        st.metric("💰 Custo Insumos", f"R$ {total_insumos:,.2f}")
+    
+    with col4:
+        receita_estimada = total_caixas * config.get("preco_medio_caixa", 30)
+        lucro_estimado = receita_estimada - total_insumos if receita_estimada else 0
+        st.metric("💵 Lucro Estimado", f"R$ {lucro_estimado:,.2f}")
+    
+    # Alertas
+    st.subheader("⚠️ Alertas e Recomendações")
+    
+    if not df_prod.empty:
+        # Alertas de produção
+        df_prod["pct_segunda"] = np.where(
+            (df_prod["caixas"] + df_prod["caixas_segunda"]) > 0,
+            df_prod["caixas_segunda"] / (df_prod["caixas"] + df_prod["caixas_segunda"]) * 100,
+            0
+        )
+        
+        alta_segunda = df_prod[df_prod["pct_segunda"] > config.get("alerta_pct_segunda", 25)]
+        if not alta_segunda.empty:
+            st.warning(f"Alto percentual de 2ª qualidade ({alta_segunda['pct_segunda'].mean():.1f}%)")
+        
+        # Alertas de clima
+        ultimo_clima = df_prod.iloc[-1] if not df_prod.empty else None
+        if ultimo_clima is not None and ultimo_clima["umidade"] > 85:
+            st.error("Alerta: Umidade muito alta, risco de doenças fúngicas!")
+        
+        if ultimo_clima is not None and ultimo_clima["temperatura"] < 10:
+            st.error("Alerta: Temperatura muito baixa, risco de danos às plantas!")
+    
+    # Gráficos resumos
+    st.subheader("📊 Visão Geral")
+    
+    if not df_prod.empty:
+        col1, col2 = st.columns(2)
+        
         with col1:
-            data = st.date_input("Data", value=date.today())
-            local = st.text_input("Local/Estufa")
+            # Produção por estufa
+            prod_estufa = df_prod.groupby("estufa")[["caixas", "caixas_segunda"]].sum().reset_index()
+            if not prod_estufa.empty:
+                fig = px.bar(prod_estufa, x="estufa", y=["caixas", "caixas_segunda"], 
+                            title="Produção por Estufa", barmode="group")
+                st.plotly_chart(fig, use_container_width=True)
+        
         with col2:
-            produto = st.text_input("Produto")
-            caixas = st.number_input("Caixas (1ª)", min_value=0, step=1)
-        with col3:
-            caixas2 = st.number_input("Caixas (2ª)", min_value=0, step=1)
+            # Evolução temporal
+            df_prod["data"] = pd.to_datetime(df_prod["data"])
+            prod_temporal = df_prod.groupby("data")[["caixas", "caixas_segunda"]].sum().reset_index()
+            if not prod_temporal.empty:
+                fig = px.line(prod_temporal, x="data", y=["caixas", "caixas_segunda"], 
+                             title="Evolução da Produção", markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+    
+    if not df_ins.empty:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Custos por tipo de insumo
+            custos_tipo = df_ins.groupby("tipo")["custo_total"].sum().reset_index()
+            if not custos_tipo.empty:
+                fig = px.pie(custos_tipo, values="custo_total", names="tipo", 
+                            title="Distribuição de Custos por Tipo")
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Custos por cultura
+            custos_cultura = df_ins.groupby("cultura")["custo_total"].sum().reset_index()
+            if not custos_cultura.empty:
+                fig = px.bar(custos_cultura, x="cultura", y="custo_total", 
+                            title="Custos por Cultura")
+                st.plotly_chart(fig, use_container_width=True)
 
-        # Busca clima automático
-        clima = clima_atual(cidade)
-        if clima:
-            temperatura = clima["temp"]
-            umidade = clima["umidade"]
-            chuva = clima["chuva"]
-            st.info(f"Clima carregado: 🌡️ {temperatura}°C | 💧 {umidade}% | 🌧️ {chuva}mm")
-        else:
-            st.warning("Não foi possível carregar dados climáticos automaticamente")
-            temperatura = st.number_input("Temperatura (°C)", min_value=0.0, step=0.1, value=25.0)
-            umidade = st.number_input("Umidade (%)", min_value=0.0, step=0.1, value=60.0)
-            chuva = st.number_input("Chuva (mm)", min_value=0.0, step=0.1, value=0.0)
+# ===============================
+# PÁGINA: CADASTRO PRODUÇÃO
+# ===============================
+elif pagina == "Cadastro Produção":
+    st.title("📝 Cadastro de Produção")
+    df = carregar_tabela("producao")
+    cidade = st.sidebar.text_input("🌍 Cidade para clima", value=config.get("cidade", CIDADE_PADRAO))
+
+    with st.form("form_cadastro_producao", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        with col1: 
+            data_val = st.date_input("Data", value=date.today())
+            estufa = st.text_input("Estufa/Área")
+        with col2: 
+            cultura = st.text_input("Cultura")
+            caixas = st.number_input("Caixas (1ª)", min_value=0, step=1)
+        with col3: 
+            caixas2 = st.number_input("Caixas (2ª)", min_value=0, step=1)
+            observacao = st.text_input("Observações")
+        
+        st.markdown("#### Clima")
+        clima_atual, previsao = buscar_clima(cidade)
+        
+        if clima_atual: 
+            temperatura, umidade, chuva = clima_atual["temp"], clima_atual["umidade"], clima_atual["chuva"]
+            st.info(f"🌡️ {temperatura:.1f}°C | 💧 {umidade:.0f}% | 🌧️ {chuva:.1f}mm (atual)")
+        else: 
+            c1, c2, c3 = st.columns(3)
+            with c1: temperatura = st.number_input("Temperatura (°C)", value=25.0)
+            with c2: umidade = st.number_input("Umidade (%)", value=65.0)
+            with c3: chuva = st.number_input("Chuva (mm)", value=0.0)
 
         enviado = st.form_submit_button("Salvar Registro ✅")
         if enviado:
             novo = pd.DataFrame([{
-                "Data": pd.to_datetime(data),
-                "Local": local,
-                "Produto": produto,
-                "Caixas": caixas,
-                "Caixas de Segunda": caixas2,
-                "Temperatura": temperatura,
-                "Umidade": umidade,
-                "Chuva": chuva
+                "data": str(data_val),
+                "estufa": estufa.strip(),
+                "cultura": cultura.strip(),
+                "caixas": int(caixas),
+                "caixas_segunda": int(caixas2),
+                "temperatura": float(temperatura),
+                "umidade": float(umidade),
+                "chuva": float(chuva),
+                "observacao": observacao
             }])
-            df = pd.concat([df, novo], ignore_index=True)
-            salvar_dados(df)
+            inserir_tabela("producao", novo)
             st.success("Registro salvo com sucesso!")
 
     if not df.empty:
-        st.markdown("### 📋 Registros já cadastrados")
-        st.dataframe(df.tail(10), use_container_width=True)
+        st.markdown("### 📋 Registros recentes")
+        df_display = df.sort_values("data", ascending=False).head(15)
+        st.dataframe(df_display, use_container_width=True)
+        
+        # Excluir linha
+        ids = st.multiselect("Selecione ID(s) para excluir", df["id"].tolist())
+        if st.button("Excluir selecionados"):
+            for i in ids: 
+                excluir_linha("producao", i)
+            st.success("✅ Linhas excluídas!")
+            st.rerun()
 
-# ================================
-# PÁGINA CADASTRO DE INSUMOS
-# ================================
-elif pagina == "Cadastro de Insumos":
-    st.title("💰 Cadastro de Insumos")
-    df_insumos = carregar_insumos()
+    # Import Excel
+    st.subheader("📂 Importar Excel")
+    uploaded_file = st.file_uploader("Envie planilha Excel (Produção)", type=["xlsx"])
+    if uploaded_file:
+        df_excel = pd.read_excel(uploaded_file)
+        df_excel = normalizar_colunas(df_excel)
+        inserir_tabela("producao", df_excel)
+        st.success("✅ Dados importados do Excel!")
+        st.rerun()
 
+# ===============================
+# PÁGINA: CADASTRO INSUMOS
+# ===============================
+elif pagina == "Cadastro Insumos":
+    st.title("📦 Cadastro de Insumos")
+    df_ins = carregar_tabela("insumos")
+    
     with st.form("form_insumos", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
+        
         with col1:
-            data = st.date_input("Data", value=date.today())
-            tipo = st.selectbox("Tipo de Insumo", ["Semente", "Fertilizante", "Defensivo", "Mão de Obra", "Equipamento", "Outros"])
+            data_i = st.date_input("Data", value=date.today())
+            estufa_i = st.text_input("Estufa/Área")
+            cultura_i = st.text_input("Cultura (opcional)")
+            tipo_i = st.selectbox("Tipo de Insumo", TIPOS_INSUMOS)
+            fornecedor_i = st.text_input("Fornecedor (opcional)")
+            
         with col2:
-            descricao = st.text_input("Descrição")
-            quantidade = st.number_input("Quantidade", min_value=0.0, step=0.1)
-            unidade = st.selectbox("Unidade", ["kg", "L", "un", "h", "sc", "outro"])
-        with col3:
-            custo = st.number_input("Custo (R$)", min_value=0.0, step=0.01)
-            local = st.text_input("Local aplicado")
-
-        enviado = st.form_submit_button("Salvar Insumo ✅")
-        if enviado:
+            qtd_i = st.number_input("Quantidade", min_value=0.0, step=0.1)
+            un_i = st.selectbox("Unidade", UNIDADES)
+            custo_unit_i = st.number_input("Custo Unitário (R$)", min_value=0.0, step=0.01, value=0.0)
+            custo_total_i = st.number_input("Custo Total (R$)", min_value=0.0, step=0.01, 
+                                          value=0.0, 
+                                          help="Se não preenchido, será calculado automaticamente")
+            lote_i = st.text_input("Nº Lote (opcional)")
+            
+        observacoes_i = st.text_area("Observações")
+        
+        # Calcular custo total automaticamente se necessário
+        if custo_unit_i > 0 and qtd_i > 0 and custo_total_i == 0:
+            custo_total_i = custo_unit_i * qtd_i
+            st.info(f"Custo total calculado: R$ {custo_total_i:.2f}")
+            
+        enviado_i = st.form_submit_button("Salvar Insumo ✅")
+        if enviado_i:
             novo = pd.DataFrame([{
-                "Data": pd.to_datetime(data),
-                "Tipo": tipo,
-                "Descricao": descricao,
-                "Quantidade": quantidade,
-                "Unidade": unidade,
-                "Custo": custo,
-                "Local": local
+                "data": str(data_i),
+                "estufa": estufa_i,
+                "cultura": cultura_i,
+                "tipo": tipo_i,
+                "quantidade": qtd_i,
+                "unidade": un_i,
+                "custo_unitario": custo_unit_i,
+                "custo_total": custo_total_i if custo_total_i > 0 else custo_unit_i * qtd_i,
+                "fornecedor": fornecedor_i,
+                "lote": lote_i,
+                "observacoes": observacoes_i
             }])
-            df_insumos = pd.concat([df_insumos, novo], ignore_index=True)
-            salvar_insumos(df_insumos)
+            inserir_tabela("insumos", novo)
             st.success("Insumo salvo com sucesso!")
 
-    if not df_insumos.empty:
-        st.markdown("### 📋 Insumos cadastrados")
-        st.dataframe(df_insumos.tail(10), use_container_width=True)
-
-# ================================
-# PÁGINA CONFIGURAÇÕES
-# ================================
-elif pagina == "Configurações":
-    st.title("⚙️ Configurações de Preços e Custos")
-    config = carregar_config_precos()
-
-    with st.form("form_config"):
-        col1, col2 = st.columns(2)
-        with col1:
-            preco_primeira = st.number_input("Preço Caixa 1ª Qualidade (R$)", 
-                                           value=float(config['preco_primeira']), 
-                                           min_value=0.0, step=0.5)
-            preco_segunda = st.number_input("Preço Caixa 2ª Qualidade (R$)", 
-                                          value=float(config['preco_segunda']), 
-                                          min_value=0.0, step=0.5)
-        with col2:
-            custos_fixos = st.number_input("Custos Fixos Mensais (R$)", 
-                                         value=float(config['custos_fixos']), 
-                                         min_value=0.0, step=10.0)
+    if not df_ins.empty:
+        st.subheader("📋 Histórico de Insumos")
         
-        salvar_config = st.form_submit_button("Salvar Configurações 💾")
-        if salvar_config:
-            novo_config = {
-                "preco_primeira": preco_primeira,
-                "preco_segunda": preco_segunda,
-                "custos_fixos": custos_fixos
-            }
-            salvar_config_precos(novo_config)
-            st.success("Configurações salvas com sucesso!")
-
-# ================================
-# PÁGINA ANÁLISE
-# ================================
-elif pagina == "Análise":
-    st.title("📊 Análise Avançada")
-    st.markdown("Escolha a fonte de dados:")
-    fonte = st.radio("Fonte de dados:", ["Usar dados cadastrados no app","Enviar um arquivo Excel"], horizontal=True)
-
-    df_raw = None
-    if fonte == "Usar dados cadastrados no app":
-        df_raw = carregar_dados()
-    else:
-        arquivo = st.file_uploader("Selecione um arquivo Excel", type=["xlsx","xls"])
-        if arquivo:
-            df_raw = pd.read_excel(arquivo)
-
-    if df_raw is None or df_raw.empty:
-        st.warning("Nenhum dado disponível.")
-        st.stop()
-
-    df_norm = normalizar_colunas(df_raw)
-
-    # FILTROS
-    st.sidebar.markdown("## 🔎 Filtros")
-    min_date = df_norm["Data"].min().date() if not df_norm["Data"].isna().all() else date.today()
-    max_date = df_norm["Data"].max().date() if not df_norm["Data"].isna().all() else date.today()
-    date_range = st.sidebar.date_input("Período", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-
-    locais_all = sorted(df_norm["Local"].dropna().unique())
-    locais_sel = st.sidebar.multiselect("Local (todos se vazio)", locais_all, default=locais_all)
-
-    produtos_all = sorted(df_norm["Produto"].dropna().unique())
-    produtos_sel = st.sidebar.multiselect("Produto (todos se vazio)", produtos_all, default=produtos_all)
-
-    df_filt = df_norm.copy()
-    try:
-        start_date, end_date = date_range
-    except:
-        start_date = end_date = date_range
-    df_filt = df_filt[(df_filt["Data"] >= pd.to_datetime(start_date)) & (df_filt["Data"] <= pd.to_datetime(end_date))]
-
-    if locais_sel:
-        df_filt = df_filt[df_filt["Local"].isin(locais_sel)]
-    if produtos_sel:
-        df_filt = df_filt[df_filt["Produto"].isin(produtos_sel)]
-
-    if df_filt.empty:
-        st.warning("Nenhum dado após aplicar os filtros.")
-        st.stop()
-
-    df_filt["Total"] = df_filt["Caixas"] + df_filt["Caixas de Segunda"]
-
-    # KPIs
-    total = df_filt["Total"].sum()
-    media = df_filt["Total"].mean()
-    maior = df_filt["Total"].max()
-    menor = df_filt["Total"].min()
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total de Caixas", f"{total:,.0f}")
-    k2.metric("Média por Registro", f"{media:,.2f}")
-    k3.metric("Máximo em 1 Registro", f"{maior:,.0f}")
-    k4.metric("Mínimo em 1 Registro", f"{menor:,.0f}")
-
-    st.markdown("---")
-
-    # GRÁFICOS BÁSICOS
-    st.subheader("🏭 Total por Local")
-    fig, ax = plt.subplots(figsize=(12,6))
-    plot_bar(ax, "Local", "Total", df_filt, 
-             cores=sns.color_palette("tab20", n_colors=len(df_filt["Local"].unique())),
-             titulo="Total de Caixas por Local", ylabel="Total de Caixas")
-    st.pyplot(fig)
-
-    st.subheader("🍅 Total por Produto")
-    fig, ax = plt.subplots(figsize=(10,5))
-    plot_bar(ax, "Produto", "Total", df_filt,
-             cores=sns.color_palette("Set2", n_colors=len(df_filt["Produto"].unique())),
-             titulo="Total de Caixas por Produto", ylabel="Total de Caixas")
-    st.pyplot(fig)
-
-    # Comparativo 1ª vs 2ª
-    st.subheader("📊 Comparativo Caixas 1ª vs 2ª")
-    for tipo in ["Local", "Produto"]:
-        if tipo in df_filt.columns:
-            df_comp = df_filt.groupby(tipo)[["Caixas", "Caixas de Segunda"]].sum().reset_index()
-            fig, ax = plt.subplots(figsize=(12,6))
-            df_comp.plot(kind="bar", x=tipo, ax=ax, width=0.7)
-            ax.set_ylabel("Quantidade de Caixas")
-            ax.set_title(f"Caixas de Primeira vs Segunda por {tipo}")
-            ax.grid(axis="y")
-            ax.legend(["Caixas (1ª)", "Caixas de Segunda"])
-            ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-            for p in ax.patches:
-                ax.text(p.get_x()+p.get_width()/2, p.get_height()+max(df_filt["Total"])*0.01, f'{int(p.get_height())}', ha='center')
-            st.pyplot(fig)
-
-    # Percentual 2ª linha
-    st.markdown("---")
-    st.subheader("📦 Percentual de Caixas de 2ª Linha")
-
-    # Por Produto
-    df_prod_pct = (
-        df_filt.groupby("Produto")[["Caixas", "Caixas de Segunda"]]
-        .sum()
-        .reset_index()
-    )
-    df_prod_pct["Pct_2a"] = (df_prod_pct["Caixas de Segunda"] / (df_prod_pct["Caixas"] + df_prod_pct["Caixas de Segunda"])) * 100
-
-    fig, ax = plt.subplots(figsize=(10,5))
-    sns.barplot(data=df_prod_pct, x="Produto", y="Pct_2a", ax=ax, palette="viridis")
-    ax.set_ylabel("% Caixas 2ª")
-    ax.set_title("Percentual de Caixas de 2ª por Produto")
-    for container in ax.containers:
-        ax.bar_label(container, fmt="%.1f%%")
-    st.pyplot(fig)
-
-    # Por Local
-    df_loc_pct = (
-        df_filt.groupby("Local")[["Caixas", "Caixas de Segunda"]]
-        .sum()
-        .reset_index()
-    )
-    df_loc_pct["Pct_2a"] = (df_loc_pct["Caixas de Segunda"] / (df_loc_pct["Caixas"] + df_loc_pct["Caixas de Segunda"])) * 100
-
-    fig, ax = plt.subplots(figsize=(10,5))
-    sns.barplot(data=df_loc_pct, x="Local", y="Pct_2a", ax=ax, palette="mako")
-    ax.set_ylabel("% Caixas 2ª")
-    ax.set_title("Percentual de Caixas de 2ª por Local")
-    for container in ax.containers:
-        ax.bar_label(container, fmt="%.1f%%")
-    st.pyplot(fig)
-
-    # ANÁLISE DE TENDÊNCIAS SIMPLES
-    st.markdown("---")
-    st.subheader("📈 Análise de Tendências")
-    
-    resultado_analise = analisar_tendencias_simples(df_filt)
-    
-    if "mensagem" in resultado_analise:
-        st.info(resultado_analise["mensagem"])
-    elif "erro" in resultado_analise:
-        st.error(resultado_analise["erro"])
-    else:
+        # Filtros
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Tendência Mensal", f"{resultado_analise['tendencia_mensal']:.1f}%")
+            filtro_tipo = st.multiselect("Filtrar por tipo", options=df_ins["tipo"].unique())
         with col2:
-            st.metric("Previsão Mensal", f"{resultado_analise['previsao_mensal']:,.0f} caixas")
+            filtro_estufa = st.multiselect("Filtrar por estufa", options=df_ins["estufa"].unique())
         with col3:
-            st.metric("Status", resultado_analise['status'])
+            filtro_cultura = st.multiselect("Filtrar por cultura", options=df_ins["cultura"].unique())
         
-        # Correlações
-        st.subheader("🔗 Correlações com Fatores Climáticos")
-        correl_df = pd.DataFrame({
-            'Fator': ['Temperatura', 'Umidade', 'Chuva'],
-            'Correlação': [
-                resultado_analise['correlacoes']['temp_producao'],
-                resultado_analise['correlacoes']['umidade_producao'],
-                resultado_analise['correlacoes']['chuva_producao']
-            ]
-        })
+        # Aplicar filtros
+        df_filtrado = df_ins.copy()
+        if filtro_tipo:
+            df_filtrado = df_filtrado[df_filtrado["tipo"].isin(filtro_tipo)]
+        if filtro_estufa:
+            df_filtrado = df_filtrado[df_filtrado["estufa"].isin(filtro_estufa)]
+        if filtro_cultura:
+            df_filtrado = df_filtrado[df_filtrado["cultura"].isin(filtro_cultura)]
+            
+        st.dataframe(df_filtrado.sort_values("data", ascending=False).head(20), use_container_width=True)
         
-        fig, ax = plt.subplots(figsize=(10, 6))
-        sns.barplot(data=correl_df, x='Fator', y='Correlação', ax=ax, palette='coolwarm')
-        ax.set_title('Correlação entre Fatores Climáticos e Produção')
-        ax.set_ylim(-1, 1)
-        for container in ax.containers:
-            ax.bar_label(container, fmt="%.2f")
-        st.pyplot(fig)
+        # Estatísticas de custos
+        st.subheader("📊 Estatísticas de Custos")
+        if not df_filtrado.empty:
+            total_custo = df_filtrado["custo_total"].sum()
+            media_custo = df_filtrado["custo_total"].mean()
+            st.write(f"**Total gasto:** R$ {total_custo:,.2f} | **Média por registro:** R$ {media_custo:,.2f}")
+            
+            # Gráfico de evolução de custos
+            df_filtrado["data"] = pd.to_datetime(df_filtrado["data"])
+            custos_mensais = df_filtrado.groupby(df_filtrado["data"].dt.to_period("M"))["custo_total"].sum().reset_index()
+            custos_mensais["data"] = custos_mensais["data"].astype(str)
+            
+            fig = px.bar(custos_mensais, x="data", y="custo_total", 
+                        title="Evolução Mensal de Custos com Insumos")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Excluir registros
+        ids_insumos = st.multiselect("Selecione ID(s) de insumos para excluir", df_ins["id"].tolist())
+        if st.button("Excluir insumos selecionados"):
+            for i in ids_insumos: 
+                excluir_linha("insumos", i)
+            st.success("✅ Insumos excluídos!")
+            st.rerun()
 
-    # BALANÇO FINANCEIRO
-    st.markdown("---")
-    st.subheader("💰 Balanço Financeiro")
+    # Import Excel para insumos
+    st.subheader("📂 Importar Excel (Insumos)")
+    uploaded_file = st.file_uploader("Envie planilha Excel (Insumos)", type=["xlsx"], key="insumos_upload")
+    if uploaded_file:
+        df_excel = pd.read_excel(uploaded_file)
+        df_excel.rename(columns=lambda x: x.lower(), inplace=True)
+        inserir_tabela("insumos", df_excel)
+        st.success("✅ Dados de insumos importados do Excel!")
+        st.rerun()
+
+# ===============================
+# PÁGINA: ANÁLISE
+# ===============================
+elif pagina == "Análise":
+    st.title("📊 Análise Avançada de Produção e Custos")
     
-    df_insumos = carregar_insumos()
-    config = carregar_config_precos()
+    # Carregar dados
+    df_prod = carregar_tabela("producao")
+    df_ins = carregar_tabela("insumos")
     
-    # Filtrar insumos pelo mesmo período
-    if not df_insumos.empty and "Data" in df_insumos.columns:
-        df_insumos["Data"] = pd.to_datetime(df_insumos["Data"])
-        df_insumos_filtrado = df_insumos[
-            (df_insumos["Data"] >= pd.to_datetime(start_date)) & 
-            (df_insumos["Data"] <= pd.to_datetime(end_date))
-        ]
+    if df_prod.empty and df_ins.empty:
+        st.warning("📭 Nenhum dado disponível para análise. Cadastre dados de produção e insumos primeiro.")
+        st.stop()
+    
+    # Filtros avançados na sidebar
+    st.sidebar.subheader("🔍 Filtros de Análise")
+    
+    # Período temporal
+    if not df_prod.empty:
+        datas_disponiveis = pd.to_datetime(df_prod['data']).sort_values()
+        min_date = datas_disponiveis.min().date()
+        max_date = datas_disponiveis.max().date()
     else:
-        df_insumos_filtrado = pd.DataFrame()
+        min_date = date.today() - timedelta(days=365)
+        max_date = date.today()
     
-    balanco = calcular_balanco(df_filt, df_insumos_filtrado, config)
+    date_range = st.sidebar.date_input(
+        "📅 Período de análise",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+    
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date, end_date = min_date, max_date
+    
+    # Filtros adicionais
+    col1, col2 = st.sidebar.columns(2)
+    
+    with col1:
+        if not df_prod.empty:
+            estufas_disponiveis = df_prod['estufa'].unique()
+            estufas_selecionadas = st.multiselect(
+                "🏭 Estufas", 
+                options=estufas_disponiveis,
+                default=estufas_disponiveis
+            )
+        else:
+            estufas_selecionadas = []
+        
+        if not df_ins.empty:
+            tipos_insumos_disponiveis = df_ins['tipo'].unique()
+            tipos_selecionados = st.multiselect(
+                "📦 Tipos de Insumos", 
+                options=tipos_insumos_disponiveis,
+                default=tipos_insumos_disponiveis
+            )
+        else:
+            tipos_selecionados = []
+    
+    with col2:
+        if not df_prod.empty:
+            culturas_disponiveis = df_prod['cultura'].unique()
+            culturas_selecionadas = st.multiselect(
+                "🌱 Culturas", 
+                options=culturas_disponiveis,
+                default=culturas_disponiveis
+            )
+        else:
+            culturas_selecionadas = []
+    
+    # Aplicar filtros
+    if not df_prod.empty:
+        df_prod['data'] = pd.to_datetime(df_prod['data'])
+        df_prod_filtrado = df_prod[
+            (df_prod['data'] >= pd.to_datetime(start_date)) & 
+            (df_prod['data'] <= pd.to_datetime(end_date))
+        ]
+        if estufas_selecionadas:
+            df_prod_filtrado = df_prod_filtrado[df_prod_filtrado['estufa'].isin(estufas_selecionadas)]
+        if culturas_selecionadas:
+            df_prod_filtrado = df_prod_filtrado[df_prod_filtrado['cultura'].isin(culturas_selecionadas)]
+    else:
+        df_prod_filtrado = pd.DataFrame()
+    
+    if not df_ins.empty:
+        df_ins['data'] = pd.to_datetime(df_ins['data'])
+        df_ins_filtrado = df_ins[
+            (df_ins['data'] >= pd.to_datetime(start_date)) & 
+            (df_ins['data'] <= pd.to_datetime(end_date))
+        ]
+        if tipos_selecionados:
+            df_ins_filtrado = df_ins_filtrado[df_ins_filtrado['tipo'].isin(tipos_selecionados)]
+    else:
+        df_ins_filtrado = pd.DataFrame()
+    
+    # Métricas de performance
+    st.header("📈 Métricas de Performance")
     
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Receita Total", f"R$ {balanco['receita_total']:,.2f}")
-    col2.metric("Custos Totais", f"R$ {balanco['custos_totais']:,.2f}")
-    col3.metric("Lucro", f"R$ {balanco['lucro']:,.2f}")
-    col4.metric("Margem de Lucro", f"{balanco['margem_lucro']:.1f}%")
     
-    # Gráfico de balanço
-    fig, ax = plt.subplots(figsize=(10, 6))
-    categorias = ['Receita 1ª', 'Receita 2ª', 'Custos Insumos', 'Custos Fixos']
-    valores = [balanco['receita_primeira'], balanco['receita_segunda'], 
-              balanco['custos_insumos'], balanco['custos_fixos']]
+    with col1:
+        if not df_prod_filtrado.empty:
+            total_caixas = df_prod_filtrado['caixas'].sum()
+            st.metric("📦 Caixas 1ª Qualidade", f"{total_caixas:,.0f}")
+        else:
+            st.metric("📦 Caixas 1ª Qualidade", "0")
     
-    cores = ['#2ecc71', '#27ae60', '#e74c3c', '#c0392b']
-    bars = ax.bar(categorias, valores, color=cores)
-    ax.set_ylabel('Valores (R$)')
-    ax.set_title('Composição do Balanço Financeiro')
+    with col2:
+        if not df_prod_filtrado.empty:
+            total_segunda = df_prod_filtrado['caixas_segunda'].sum()
+            pct_segunda = (total_segunda / (total_caixas + total_segunda) * 100) if (total_caixas + total_segunda) > 0 else 0
+            st.metric("🔄 % 2ª Qualidade", f"{pct_segunda:.1f}%")
+        else:
+            st.metric("🔄 % 2ª Qualidade", "0%")
     
-    for bar, valor in zip(bars, valores):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(valores)*0.01, 
-                f'R$ {valor:,.2f}', ha='center')
+    with col3:
+        if not df_ins_filtrado.empty:
+            custo_total = df_ins_filtrado['custo_total'].sum()
+            st.metric("💰 Custo Total", f"R$ {custo_total:,.2f}")
+        else:
+            st.metric("💰 Custo Total", "R$ 0,00")
     
-    st.pyplot(fig)
+    with col4:
+        if not df_prod_filtrado.empty and not df_ins_filtrado.empty:
+            receita_estimada = total_caixas * config.get('preco_medio_caixa', 30)
+            lucro = receita_estimada - custo_total
+            st.metric("💵 Lucro Estimado", f"R$ {lucro:,.2f}")
+        else:
+            st.metric("💵 Lucro Estimado", "R$ 0,00")
+    
+    # Análise de Produção
+    if not df_prod_filtrado.empty:
+        st.header("🌱 Análise de Produção")
+        
+        tab1, tab2, tab3, tab4 = st.tabs(["Visão Geral", "Por Cultura", "Por Estufa", "Tendências"])
+        
+        with tab1:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Produção diária
+                prod_diaria = df_prod_filtrado.groupby('data')[['caixas', 'caixas_segunda']].sum().reset_index()
+                fig = px.line(prod_diaria, x='data', y=['caixas', 'caixas_segunda'],
+                             title='📅 Produção Diária', markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Qualidade da produção
+                qualidade_data = pd.DataFrame({
+                    'Categoria': ['1ª Qualidade', '2ª Qualidade'],
+                    'Quantidade': [total_caixas, total_segunda]
+                })
+                fig = px.pie(qualidade_data, values='Quantidade', names='Categoria',
+                            title='🎯 Distribuição por Qualidade')
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with tab2:
+            # Análise por cultura
+            prod_cultura = df_prod_filtrado.groupby('cultura')[['caixas', 'caixas_segunda']].sum().reset_index()
+            prod_cultura['Total'] = prod_cultura['caixas'] + prod_cultura['caixas_segunda']
+            prod_cultura['% 2ª'] = (prod_cultura['caixas_segunda'] / prod_cultura['Total'] * 100).round(1)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig = px.bar(prod_cultura, x='cultura', y=['caixas', 'caixas_segunda'],
+                            title='🌿 Produção por Cultura', barmode='group')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                fig = px.bar(prod_cultura, x='cultura', y='% 2ª',
+                            title='📊 Percentual de 2ª por Cultura')
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with tab3:
+            # Análise por estufa
+            prod_estufa = df_prod_filtrado.groupby('estufa')[['caixas', 'caixas_segunda']].sum().reset_index()
+            dias_producao = len(df_prod_filtrado['data'].unique())
+            prod_estufa['Produtividade'] = prod_estufa['caixas'] / dias_producao if dias_producao > 0 else 0
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig = px.bar(prod_estufa, x='estufa', y='caixas',
+                            title='🏭 Produção Total por Estufa')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                fig = px.bar(prod_estufa, x='estufa', y='Produtividade',
+                            title='📈 Produtividade Média Diária')
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with tab4:
+            # Análise de tendências
+            df_prod_filtrado['semana'] = df_prod_filtrado['data'].dt.isocalendar().week
+            prod_semanal = df_prod_filtrado.groupby('semana')[['caixas', 'caixas_segunda']].sum().reset_index()
+            
+            fig = px.line(prod_semanal, x='semana', y=['caixas', 'caixas_segunda'],
+                         title='📈 Tendência Semanal de Produção', markers=True)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # Análise de Custos
+    if not df_ins_filtrado.empty:
+        st.header("💰 Análise de Custos")
+        
+        tab1, tab2, tab3 = st.tabs(["Visão Geral", "Por Tipo", "Eficiência"])
+        
+        with tab1:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Evolução de custos
+                custos_mensais = df_ins_filtrado.groupby(df_ins_filtrado['data'].dt.to_period('M'))['custo_total'].sum().reset_index()
+                custos_mensais['data'] = custos_mensais['data'].astype(str)
+                fig = px.line(custos_mensais, x='data', y='custo_total',
+                             title='📅 Evolução Mensal de Custos', markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Distribuição por cultura
+                custos_cultura = df_ins_filtrado.groupby('cultura')['custo_total'].sum().reset_index()
+                if not custos_cultura.empty:
+                    fig = px.pie(custos_cultura, values='custo_total', names='cultura',
+                                title='🌿 Custos por Cultura')
+                    st.plotly_chart(fig, use_container_width=True)
+        
+        with tab2:
+            # Análise por tipo de insumo
+            custos_tipo = df_ins_filtrado.groupby('tipo')['custo_total'].sum().reset_index()
+            custos_tipo = custos_tipo.sort_values('custo_total', ascending=False)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig = px.bar(custos_tipo, x='tipo', y='custo_total',
+                            title='📦 Custos por Tipo de Insumo')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                fig = px.pie(custos_tipo, values='custo_total', names='tipo',
+                            title='📊 Distribuição Percentual')
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with tab3:
+            # Análise de eficiência (custo vs produção)
+            if not df_prod_filtrado.empty:
+                # Agrupar dados por cultura para análise de eficiência
+                custos_por_cultura = df_ins_filtrado.groupby('cultura')['custo_total'].sum().reset_index()
+                producao_por_cultura = df_prod_filtrado.groupby('cultura')['caixas'].sum().reset_index()
+                
+                eficiencia = pd.merge(custos_por_cultura, producao_por_cultura, on='cultura', how='inner')
+                eficiencia['Custo por Caixa'] = eficiencia['custo_total'] / eficiencia['caixas']
+                eficiencia['Custo por Caixa'] = eficiencia['Custo por Caixa'].round(2)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig = px.bar(eficiencia, x='cultura', y='Custo por Caixa',
+                                title='📊 Custo por Caixa (1ª Qualidade)')
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    st.dataframe(eficiencia[['cultura', 'custo_total', 'caixas', 'Custo por Caixa']]
+                                .rename(columns={
+                                    'cultura': 'Cultura',
+                                    'custo_total': 'Custo Total (R$)',
+                                    'caixas': 'Caixas 1ª'
+                                }), use_container_width=True)
+    
+    # Análise de Rentabilidade
+    if not df_prod_filtrado.empty and not df_ins_filtrado.empty:
+        st.header("💵 Análise de Rentabilidade")
+        
+        # Calcular receita e lucro por cultura
+        receita_por_cultura = df_prod_filtrado.groupby('cultura')['caixas'].sum().reset_index()
+        receita_por_cultura['Receita'] = receita_por_cultura['caixas'] * config.get('preco_medio_caixa', 30)
+        
+        custos_por_cultura = df_ins_filtrado.groupby('cultura')['custo_total'].sum().reset_index()
+        
+        rentabilidade = pd.merge(receita_por_cultura, custos_por_cultura, on='cultura', how='left').fillna(0)
+        rentabilidade['Lucro'] = rentabilidade['Receita'] - rentabilidade['custo_total']
+        rentabilidade['Margem'] = (rentabilidade['Lucro'] / rentabilidade['Receita'] * 100).round(1)
+        rentabilidade['ROI'] = (rentabilidade['Lucro'] / rentabilidade['custo_total'] * 100).round(1)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig = px.bar(rentabilidade, x='cultura', y='Lucro',
+                        title='📈 Lucro por Cultura')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            fig = px.bar(rentabilidade, x='cultura', y='Margem',
+                        title='📊 Margem de Lucro (%)')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Tabela detalhada
+        st.subheader("📋 Resumo de Rentabilidade por Cultura")
+        rentabilidade_display = rentabilidade[['cultura', 'caixas', 'Receita', 'custo_total', 'Lucro', 'Margem', 'ROI']]
+        rentabilidade_display.columns = ['Cultura', 'Caixas 1ª', 'Receita (R$)', 'Custos (R$)', 'Lucro (R$)', 'Margem (%)', 'ROI (%)']
+        st.dataframe(rentabilidade_display.style.format({
+            'Receita (R$)': '{:,.2f}',
+            'Custos (R$)': '{:,.2f}', 
+            'Lucro (R$)': '{:,.2f}'
+        }), use_container_width=True)
+    
+    # Relatório de Insights
+    st.header("🔍 Insights e Recomendações")
+    
+    if not df_prod_filtrado.empty:
+        # Calcular métricas para insights
+        pct_segunda_geral = (df_prod_filtrado['caixas_segunda'].sum() / 
+                            (df_prod_filtrado['caixas'].sum() + df_prod_filtrado['caixas_segunda'].sum()) * 100)
+        
+        # Insights de qualidade
+        if pct_segunda_geral > config.get('alerta_pct_segunda', 25):
+            st.error(f"⚠️ **Alerta de Qualidade:** Percentual de 2ª qualidade ({pct_segunda_geral:.1f}%) está acima do limite recomendado ({config.get('alerta_pct_segunda', 25)}%). Avalie práticas de cultivo.")
+        else:
+            st.success(f"✅ **Qualidade:** Percentual de 2ª qualidade ({pct_segunda_geral:.1f}%) dentro dos limites aceitáveis.")
+        
+        # Insights de produtividade
+        prod_diaria_media = df_prod_filtrado['caixas'].sum() / len(df_prod_filtrado['data'].unique()) if len(df_prod_filtrado['data'].unique()) > 0 else 0
+        st.info(f"📊 **Produtividade Média Diária:** {prod_diaria_media:.1f} caixas/dia")
+    
+    if not df_ins_filtrado.empty and not df_prod_filtrado.empty:
+        custo_total = df_ins_filtrado['custo_total'].sum()
+        receita_total = df_prod_filtrado['caixas'].sum() * config.get('preco_medio_caixa', 30)
+        lucro_total = receita_total - custo_total
+        margem_total = (lucro_total / receita_total * 100) if receita_total > 0 else 0
+        
+        st.info(f"💰 **Rentabilidade Geral:** Margem de {margem_total:.1f}% | Lucro: R$ {lucro_total:,.2f}")
+        
+        if margem_total < 20:
+            st.warning("📉 **Alerta de Rentabilidade:** Margem abaixo de 20%. Considere revisar custos ou preços.")
+        
+        # Identificar culturas mais lucrativas
+        if 'rentabilidade' in locals():
+            cultura_mais_lucrativa = rentabilidade.loc[rentabilidade['Lucro'].idxmax()] if not rentabilidade.empty else None
+            if cultura_mais_lucrativa is not None:
+                st.success(f"🏆 **Cultura mais lucrativa:** {cultura_mais_lucrativa['cultura']} (Lucro: R$ {cultura_mais_lucrativa['Lucro']:,.2f})")
 
-    # Download filtrado
-    st.markdown("---")
-    buffer = BytesIO()
-    df_filt.to_excel(buffer, index=False, engine="openpyxl")
-    buffer.seek(0)
-    st.download_button("📥 Baixar dados filtrados em Excel", data=buffer,
-                       file_name="colheitas_filtradas.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+# ===============================
+# PÁGINA: CONFIGURAÇÕES
+# ===============================
+elif pagina == "Configurações":
+    st.title("⚙️ Configurações do Sistema")
+    
+    tab1, tab2, tab3 = st.tabs(["Geral", "Fenologia", "Alertas & Preços"])
+    
+    with tab1:
+        st.subheader("Configurações Gerais")
+        cidade_nova = st.text_input("Cidade padrão para clima", value=config.get("cidade", CIDADE_PADRAO))
+        
+        if st.button("Salvar Configurações Gerais"):
+            config["cidade"] = cidade_nova
+            salvar_config(config)
+            st.success("Configurações salvas!")
+    
+    with tab2:
+        st.subheader("Estágios Fenológicos")
+        st.info("Configure os estágios de desenvolvimento das culturas e suas necessidades")
+        
+        for i, estagio in enumerate(config["fenologia"]["estagios"]):
+            with st.expander(f"Estágio: {estagio['nome']}"):
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    nome = st.text_input("Nome", value=estagio["nome"], key=f"nome_{i}")
+                with col2:
+                    dias = st.text_input("Duração (dias)", value=estagio["dias"], key=f"dias_{i}")
+                with col3:
+                    adubo = st.number_input("Adubo (kg/ha)", value=float(estagio["adubo"]), key=f"adubo_{i}")
+                with col4:
+                    agua = st.number_input("Água (L/planta)", value=float(estagio["agua"]), key=f"agua_{i}")
+                
+                config["fenologia"]["estagios"][i] = {
+                    "nome": nome, "dias": dias, "adubo": adubo, "agua": agua
+                }
+        
+        if st.button("Salvar Configurações Fenológicas"):
+            salvar_config(config)
+            st.success("Configurações fenológicas salvas!")
+    
+    with tab3:
+        st.subheader("Alertas e Preços")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            alerta_segunda = st.number_input(
+                "Alerta % 2ª Qualidade (%)", 
+                min_value=0.0, max_value=100.0, value=float(config.get("alerta_pct_segunda", 25.0))
+            )
+            
+            alerta_prod_baixo = st.number_input(
+                "Alerta Produção Baixa (%)", 
+                min_value=0.0, max_value=100.0, value=float(config.get("alerta_prod_baixo_pct", 30.0))
+            )
+            
+            preco_caixa = st.number_input(
+                "Preço Médio Caixa (R$)", 
+                min_value=0.0, value=float(config.get("preco_medio_caixa", 30.0))
+            )
+        
+        with col2:
+            st.subheader("Custos Médios por Tipo")
+            for tipo, custo in config.get("custo_medio_insumos", {}).items():
+                novo_custo = st.number_input(
+                    f"{tipo} (R$)", 
+                    min_value=0.0, value=float(custo), key=f"custo_{tipo}"
+                )
+                config["custo_medio_insumos"][tipo] = novo_custo
+        
+        if st.button("Salvar Alertas e Preços"):
+            config["alerta_pct_segunda"] = alerta_segunda
+            config["alerta_prod_baixo_pct"] = alerta_prod_baixo
+            config["preco_medio_caixa"] = preco_caixa
+            salvar_config(config)
+            st.success("Configurações de alertas e preços salvas!")
+    
+    # Backup e Restauração
+    st.subheader("💾 Backup dos Dados")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Fazer Backup"):
+            conn = sqlite3.connect(DB_NAME)
+            backup_data = {}
+            for table in ["producao", "insumos", "custos"]:
+                df = pd.read_sql(f"SELECT * FROM {table}", conn)
+                backup_data[table] = df.to_dict()
+            
+            with open("backup_dados.json", "w", encoding="utf-8") as f:
+                json.dump(backup_data, f, ensure_ascii=False, indent=4)
+            
+            st.success("Backup realizado com sucesso!")
+    
+    with col2:
+        uploaded_backup = st.file_uploader("Restaurar Backup", type=["json"])
+        if uploaded_backup and st.button("Restaurar Dados"):
+            backup_data = json.load(uploaded_backup)
+            conn = sqlite3.connect(DB_NAME)
+            
+            for table, data in backup_data.items():
+                df = pd.DataFrame(data)
+                df.to_sql(table, conn, if_exists="replace", index=False)
+            
+            st.success("Dados restaurados com sucesso!")
+            st.rerun()
+
+# ===============================
+# RODAPÉ
+# ===============================
+st.sidebar.markdown("---")
+st.sidebar.info("🌱 **Gerenciador Integrado de Produção Agrícola** v1.0")
